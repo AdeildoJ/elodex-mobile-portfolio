@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "updatedAt": "2026-03-08",
+  "notes": [
+    "Catalogo de fontes para overlays de clima.",
+    "Preferencia por assets CC0.",
+    "Este arquivo lista fontes e candidatos; os binarios devem ser baixados e convertidos para o padrao do EloDex."
+  ],
+  "targetSpec": {
+    "resolution": "1280x720",
+    "formats": ["gif", "png_spritesheet"],
+    "alphaBackground": true,
+    "loop": true,
+    "fpsRange": "12-18",
+    "maxGifSizeMB": 8
+  },
+  "libraries": [
+    {
+      "id": "kenney_particle_pack",
+      "name": "Kenney Particle Pack",
+      "url": "https://www.kenney.nl/assets/particle-pack",
+      "license": "CC0-1.0",
+      "requiresAttribution": false,
+      "status": "approved_candidate",
+      "recommendedFor": ["rain", "snow", "sandstorm", "sunny"]
+    },
+    {
+      "id": "kronbits_particles_1000",
+      "name": "Kronbits 1000 Free Game Assets (Particles)",
+      "url": "https://kronbits.itch.io/particle-pack",
+      "license": "CC0-1.0",
+      "requiresAttribution": false,
+      "status": "approved_candidate",
+      "recommendedFor": ["rain", "snow", "sandstorm", "sunny"]
+    },
+    {
+      "id": "daungames_rain_effect",
+      "name": "DaunGames 2D Pixel Rain Effect",
+      "url": "https://daungames.itch.io/rain-effect",
+      "license": "CC0",
+      "requiresAttribution": false,
+      "status": "approved_candidate",
+      "recommendedFor": ["rain"]
+    },
+    {
+      "id": "oga_animated_particles_1",
+      "name": "OpenGameArt - Animated particle effects #1",
+      "url": "https://opengameart.org/content/animated-particle-effects-1",
+      "license": "CC0",
+      "requiresAttribution": false,
+      "status": "approved_candidate",
+      "recommendedFor": ["snow", "sunny", "sandstorm"]
+    },
+    {
+      "id": "oga_dust_particle",
+      "name": "OpenGameArt - Dust particle",
+      "url": "https://opengameart.org/content/dust-particle",
+      "license": "CC-BY-3.0",
+      "requiresAttribution": true,
+      "status": "fallback_candidate",
+      "recommendedFor": ["sandstorm"]
+    }
+  ],
+  "weatherMapping": {
+    "rain": {
+      "preferredLibraryId": "daungames_rain_effect",
+      "fallbackLibraryIds": ["kenney_particle_pack", "kronbits_particles_1000"],
+      "assetPlan": {
+        "overlayGifOutput": "assets/images/battle/weather/overlay_rain.gif",
+        "overlaySpriteSheetOutput": "assets/images/battle/weather/overlay_rain_spritesheet.png"
+      }
+    },
+    "snow": {
+      "preferredLibraryId": "kenney_particle_pack",
+      "fallbackLibraryIds": ["kronbits_particles_1000", "oga_animated_particles_1"],
+      "assetPlan": {
+        "overlayGifOutput": "assets/images/battle/weather/overlay_snow.gif",
+        "overlaySpriteSheetOutput": "assets/images/battle/weather/overlay_snow_spritesheet.png"
+      }
+    },
+    "sandstorm": {
+      "preferredLibraryId": "kronbits_particles_1000",
+      "fallbackLibraryIds": ["kenney_particle_pack", "oga_dust_particle"],
+      "assetPlan": {
+        "overlayGifOutput": "assets/images/battle/weather/overlay_sandstorm.gif",
+        "overlaySpriteSheetOutput": "assets/images/battle/weather/overlay_sandstorm_spritesheet.png"
+      }
+    },
+    "sunny": {
+      "preferredLibraryId": "kenney_particle_pack",
+      "fallbackLibraryIds": ["kronbits_particles_1000", "oga_animated_particles_1"],
+      "assetPlan": {
+        "overlayGifOutput": "assets/images/battle/weather/overlay_sunny.gif",
+        "overlaySpriteSheetOutput": "assets/images/battle/weather/overlay_sunny_spritesheet.png"
+      }
+    }
+  },
+  "compliance": {
+    "doNotUseOfficialPokemonAssets": true,
+    "attributionRequiredIfUsingCcBy": true,
+    "attributionTemplate": "Asset source: {name} ({url}) - License: {license}"
+  }
+}

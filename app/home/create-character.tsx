@@ -20,7 +20,7 @@ import { VILLAINS_BY_REGION } from "../../src/data/villainsByRegion";
 import { NATURES, NatureName } from "../../src/data/natures";
 import { randomFromArray, randomGender } from "../../src/utils/random";
 
-import { auth, storage } from "../../src/services/firebase/firebaseConfig";
+import { auth, storage, db } from "../../src/services/firebase/firebaseConfig";
 import {
   createCharacterForPlayer,
   getCharacterForPlayer,
@@ -30,6 +30,7 @@ import {
 import { getPlayerProfile } from "../../src/services/firebase/players.service";
 
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
+import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 
 /**
  * ✅ Catálogo fixo local (JSON)
@@ -517,6 +518,38 @@ export default function CreateCharacterScreen() {
         // ✅ create (sem avatarUrl undefined)
         const newId: string = await createCharacterForPlayer(user.uid, payload);
 
+        // ✅ cria o Pokémon inicial como instância REAL no time (slot_1)
+        await setDoc(doc(db, "players", user.uid, "characters", newId, "time", "slot_1"), {
+          slotIndex: 1,
+
+          // identidade da espécie (catálogo fixo sempre via JSON)
+          speciesId: form.starterPokemon!.speciesId,
+          speciesName: form.starterPokemon!.speciesName,
+
+          // dados do Pokémon do jogador (mutável)
+          nickname: form.starterPokemon!.nickname,
+          level: 5,
+          nature: form.starterPokemon!.nature,
+          gender: form.starterPokemon!.gender,
+          abilityId: form.starterPokemon!.abilityId,
+
+          // estrutura pronta (sem sistema real ainda)
+          exp: { current: 0, toNext: 20 },
+          hp: { current: 18, total: 22 },
+
+          // placeholders (neutros)
+          ivs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+          evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+
+          // moves: vazio por enquanto (fallback no Game)
+          moves: [],
+
+          isStarter: true,
+
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
         // ✅ upload depois (se tiver avatarLocalUri)
         const uploadedUrl = await uploadAvatarIfNeeded(user.uid, newId);
 
@@ -998,7 +1031,7 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.10)",
   },
 
-  chipsWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  chipsWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 as any },
 
   chip: {
     paddingHorizontal: 12,
@@ -1025,7 +1058,7 @@ const styles = StyleSheet.create({
   chipText: { color: "rgba(255,255,255,0.85)", fontWeight: "700", fontSize: 12 },
   chipTextActive: { color: COLORS.white },
 
-  avatarRow: { flexDirection: "row", alignItems: "center", gap: 12 },
+  avatarRow: { flexDirection: "row", alignItems: "center", gap: 12 as any },
   avatarBox: {
     width: 72,
     height: 72,
@@ -1054,7 +1087,7 @@ const styles = StyleSheet.create({
 
   pokemonRow: {
     flexDirection: "row",
-    gap: 10,
+    gap: 10 as any,
     flexWrap: "nowrap",
     justifyContent: "space-between",
   },
@@ -1108,7 +1141,7 @@ const styles = StyleSheet.create({
 
   actions: {
     flexDirection: "row",
-    gap: 12,
+    gap: 12 as any,
     marginTop: 8,
     alignItems: "center",
   },

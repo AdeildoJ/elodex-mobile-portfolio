@@ -30,8 +30,13 @@ try {
   auth = initializeAuth(app, {
     persistence: getReactNativePersistence(AsyncStorage),
   });
-} catch (_err) {
-  auth = getAuth(app);
+} catch (err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  if (message.toLowerCase().includes("already-initialized")) {
+    auth = getAuth(app);
+  } else {
+    throw err;
+  }
 }
 
 const db = getFirestore(app);

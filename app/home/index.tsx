@@ -182,14 +182,10 @@ export default function HomeScreen() {
   }
 
   function onVipCardPress() {
-    if (playerType === "VIP") {
-      Alert.alert(
-        "VIP",
-        "Abrir tela de gerenciamento VIP (a implementar)."
-      );
-      return;
-    }
-    Alert.alert("VIP", "Abrir tela de pagamento VIP (a implementar).");
+    router.push({
+      pathname: "/payments/vip",
+      params: { mode: playerType === "VIP" ? "manage" : "upgrade" },
+    });
   }
 
   function onGoCreateCharacter() {

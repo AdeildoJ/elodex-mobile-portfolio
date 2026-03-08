@@ -1,17 +1,25 @@
-import React from "react";
+import React, { useMemo } from "react";
 import { View, Text, TouchableOpacity, StyleSheet, Alert } from "react-native";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import { COLORS } from "../../src/theme/colors";
 
 export default function VipPaymentScreen() {
   const router = useRouter();
+  const { mode } = useLocalSearchParams<{ mode?: string }>();
 
-  const handleConfirmMockPayment = () => {
+  const isManageMode = useMemo(() => mode === "manage", [mode]);
+
+  const handlePrimaryAction = () => {
+    if (isManageMode) {
+      Alert.alert("VIP ativo", "Sua conta VIP esta ativa e com beneficios liberados.");
+      return;
+    }
+
     Alert.alert(
       "Pagamento VIP (placeholder)",
-      "Pagamento confirmado (simulado). O cadastro VIP será liberado agora.",
+      "Pagamento confirmado (simulado). O cadastro VIP sera liberado agora.",
       [
         {
           text: "OK",
@@ -32,19 +40,29 @@ export default function VipPaymentScreen() {
 
       <View style={styles.container}>
         <View style={styles.card}>
-          <Text style={styles.title}>VIP</Text>
+          <Text style={styles.title}>{isManageMode ? "Gerenciar VIP" : "Upgrade VIP"}</Text>
           <Text style={styles.subtitle}>
-            Tela de pagamento (placeholder). Vamos integrar o pagamento real no final.
+            {isManageMode
+              ? "Sua conta ja esta no plano VIP. Aqui voce acompanha beneficios e renovacoes."
+              : "Plano VIP com 3 slots de personagens e recursos avancados de progressao."}
           </Text>
 
           <View style={styles.infoBox}>
             <Ionicons name="shield-checkmark-outline" size={18} color={COLORS.primary} />
             <Text style={styles.infoText}>
-              Ao confirmar o pagamento, o cadastro VIP é liberado.
+              {isManageMode
+                ? "Status atual: VIP ativo."
+                : "Ao confirmar o pagamento, o cadastro VIP e liberado."}
             </Text>
           </View>
 
-          <TouchableOpacity activeOpacity={0.9} onPress={handleConfirmMockPayment}>
+          <View style={styles.benefits}>
+            <Text style={styles.benefitItem}>- Ate 3 personagens por conta</Text>
+            <Text style={styles.benefitItem}>- Selecao avancada de inicial</Text>
+            <Text style={styles.benefitItem}>- Acesso prioritario a novidades</Text>
+          </View>
+
+          <TouchableOpacity activeOpacity={0.9} onPress={handlePrimaryAction}>
             <LinearGradient
               colors={[COLORS.primary, COLORS.secondary]}
               start={{ x: 0, y: 0 }}
@@ -52,7 +70,9 @@ export default function VipPaymentScreen() {
               style={styles.primaryButton}
             >
               <Ionicons name="card-outline" size={20} color={COLORS.white} />
-              <Text style={styles.primaryButtonText}>Confirmar pagamento</Text>
+              <Text style={styles.primaryButtonText}>
+                {isManageMode ? "Revisar assinatura" : "Confirmar pagamento"}
+              </Text>
             </LinearGradient>
           </TouchableOpacity>
 
@@ -64,7 +84,7 @@ export default function VipPaymentScreen() {
           </TouchableOpacity>
         </View>
 
-        <Text style={styles.footer}>EloDex • VIP • Tech Minimal</Text>
+        <Text style={styles.footer}>EloDex - VIP - Tech Minimal</Text>
       </View>
     </View>
   );
@@ -112,6 +132,17 @@ const styles = StyleSheet.create({
     borderColor: "rgba(59,130,246,0.20)",
   },
   infoText: { flex: 1, color: COLORS.dark, fontWeight: "700", lineHeight: 18 },
+
+  benefits: {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(45,45,45,0.10)",
+    backgroundColor: "rgba(45,45,45,0.04)",
+    gap: 6,
+  },
+  benefitItem: { color: COLORS.dark, fontWeight: "700" },
 
   primaryButton: {
     marginTop: 18,
