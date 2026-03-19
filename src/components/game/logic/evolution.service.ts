@@ -1,4 +1,5 @@
 import { isFriendshipEvolutionReady } from "./friendship.service";
+import { EVOLUTION_RULES_BY_SPECIES, type EvolutionRule } from "./evolutionCatalog";
 
 export type EvolutionContext = {
   speciesId: number;
@@ -9,26 +10,6 @@ export type EvolutionContext = {
   biomeId?: string | null;
   isDay?: boolean;
   isNight?: boolean;
-};
-
-type EvolutionRule = {
-  toSpeciesId: number;
-  minLevel?: number;
-  minFriendship?: number;
-  itemId?: string;
-  moveId?: string;
-  biomeId?: string;
-  requireDay?: boolean;
-  requireNight?: boolean;
-};
-
-const RULES_BY_SPECIES: Record<number, EvolutionRule[]> = {
-  10: [{ toSpeciesId: 11, minLevel: 7 }],
-  11: [{ toSpeciesId: 12, minLevel: 10 }],
-  443: [{ toSpeciesId: 444, minLevel: 24 }],
-  444: [{ toSpeciesId: 445, minLevel: 48 }],
-  172: [{ toSpeciesId: 25, minFriendship: 220 }],
-  25: [{ toSpeciesId: 26, itemId: "thunder-stone" }],
 };
 
 function normalize(v: unknown) {
@@ -59,7 +40,7 @@ function ruleMatches(ctx: EvolutionContext, rule: EvolutionRule) {
 
 export function resolveEvolutionTarget(ctx: EvolutionContext): number | null {
   const speciesId = Math.max(1, Number(ctx.speciesId || 1));
-  const rules = RULES_BY_SPECIES[speciesId] ?? [];
+  const rules = EVOLUTION_RULES_BY_SPECIES[speciesId] ?? [];
   for (const rule of rules) {
     if (ruleMatches(ctx, rule)) return rule.toSpeciesId;
   }
@@ -69,4 +50,3 @@ export function resolveEvolutionTarget(ctx: EvolutionContext): number | null {
 export function canEvolve(ctx: EvolutionContext) {
   return resolveEvolutionTarget(ctx) != null;
 }
-

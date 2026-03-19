@@ -10,6 +10,7 @@ export type ThiefLootResponse = {
   stolenItemId?: string | null;
   stolenPokemonSpeciesId?: number | null;
   policeInterceptRequired?: boolean;
+  policeNpcName?: string | null;
   caseId?: string | null;
 };
 
@@ -56,6 +57,9 @@ export async function resolveThiefPvpLoot(payload: {
   thiefCharacterId: string;
   victimUid: string;
   victimCharacterId: string;
+  targetScope?: "character" | "gym";
+  gymOwnerUid?: string;
+  gymPokemonEntryId?: string;
 }) {
   return callFn<ThiefLootResponse>("thiefResolvePvpLoot", payload);
 }
@@ -74,4 +78,3 @@ export async function recoverPokemonFromPolice(payload: { characterId: string })
 export async function transferHqToPolice(payload: { characterId: string; forceAll?: boolean }) {
   return callFn<RecoverResponse>("thiefTransferHqToPolice", payload);
 }
-

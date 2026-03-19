@@ -1,5 +1,6 @@
 import movesDex from "../../data/pokemon/moves.json";
 import type { BattleMove } from "./types";
+import { buildMoveEffects, buildMoveExecution } from "./moveEffectCatalog";
 
 const n = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
@@ -33,5 +34,18 @@ export function buildBattleMove(moveId: string): BattleMove {
     statChangeChance: n(m.statChangeChance),
     target: m.target == null ? undefined : String(m.target),
     isContact: Boolean(m.isContact),
+    execution: buildMoveExecution(id),
+    effects: buildMoveEffects({
+      moveId: id,
+      power: m.power,
+      damageClass: m.damageClass,
+      target: m.target,
+      drain: m.drain,
+      healing: m.healing,
+      statusAilment: m.statusAilment,
+      statusChance: m.statusChance,
+      statChanges,
+      statChangeChance: m.statChangeChance,
+    }),
   };
 }

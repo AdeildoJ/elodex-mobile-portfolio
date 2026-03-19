@@ -149,6 +149,41 @@ export function useBattleAnimationController() {
       }).start(() => resolve());
     });
 
+  const animateSemiInvulnerableEnter = (
+    side: "player" | "enemy",
+    phase: "airborne" | "underground" | "underwater" | "vanished" | null | undefined
+  ) =>
+    new Promise<void>((resolve) => {
+      const y = side === "player" ? playerY : enemyY;
+      const o = side === "player" ? playerOpacity : enemyOpacity;
+      const s = side === "player" ? playerScale : enemyScale;
+      const offset =
+        phase === "airborne" ? -54 :
+          phase === "underground" ? 42 :
+            phase === "underwater" ? 28 :
+              phase === "vanished" ? -10 :
+                18;
+      const opacity =
+        phase === "underground" || phase === "underwater" || phase === "vanished" ? 0.08 : 0.2;
+      Animated.parallel([
+        Animated.timing(y, { toValue: offset, duration: 220, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(o, { toValue: opacity, duration: 220, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.timing(s, { toValue: phase === "airborne" ? 1.04 : 0.96, duration: 220, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+      ]).start(() => resolve());
+    });
+
+  const animateSemiInvulnerableExit = (side: "player" | "enemy") =>
+    new Promise<void>((resolve) => {
+      const y = side === "player" ? playerY : enemyY;
+      const o = side === "player" ? playerOpacity : enemyOpacity;
+      const s = side === "player" ? playerScale : enemyScale;
+      Animated.parallel([
+        Animated.timing(y, { toValue: 0, duration: 180, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+        Animated.timing(o, { toValue: 1, duration: 180, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.timing(s, { toValue: 1, duration: 180, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+      ]).start(() => resolve());
+    });
+
   const resetOpacity = (side: "player" | "enemy") => {
     const o = side === "player" ? playerOpacity : enemyOpacity;
     const y = side === "player" ? playerY : enemyY;
@@ -201,6 +236,8 @@ export function useBattleAnimationController() {
     animateSwitch,
     animateSummon,
     animateHp,
+    animateSemiInvulnerableEnter,
+    animateSemiInvulnerableExit,
     resetOpacity,
     stopAll,
   }), []);

@@ -12,7 +12,7 @@ import { BattleMenu } from "./BattleMenu";
 import { BattleText } from "./BattleText";
 import { PartyMenuModal } from "./PartyMenuModal";
 import { BattleAnimationEngine } from "./BattleAnimationEngine";
-import { buildMoveAnimationSequence, resolveMoveAnimationProfile } from "./moveAnimationPresets";
+import { buildMoveAnimationSequence, type MoveAnimationProfile, resolveMoveAnimationProfile } from "./moveAnimationPresets";
 import { resolveBattleFeatureFlags } from "./battleFeatureFlags";
 import { resolveWeatherBackground, resolveWeatherOverlay, weatherToVisualMode } from "./BattleWeatherVisuals";
 import { getLocalBattleAssets } from "./localBattleAssets";
@@ -94,6 +94,31 @@ function inferSpriteGroundOffset(mon: BattleMonster | null, side: "player" | "en
   return side === "enemy" ? 5 : 4;
 }
 
+function isUsableAssetUri(value: unknown) {
+  const uri = String(value || "").trim();
+  if (!uri) return false;
+  return /^(https?:|file:|content:|asset:|data:|blob:|\/)/i.test(uri);
+}
+
+function estimateEnemyExpYield(enemy: BattleMonster) {
+  const statTotal =
+    Math.max(1, Number(enemy.stats?.hp || 0)) +
+    Math.max(1, Number(enemy.stats?.atk || 0)) +
+    Math.max(1, Number(enemy.stats?.def || 0)) +
+    Math.max(1, Number(enemy.stats?.spa || 0)) +
+    Math.max(1, Number(enemy.stats?.spd || 0)) +
+    Math.max(1, Number(enemy.stats?.spe || 0));
+  return Math.max(24, Math.round((Math.max(1, enemy.level) * Math.max(120, statTotal)) / 32));
+}
+
+function nextExpThreshold(level: number, fallback?: number) {
+  const base = Math.max(60, Math.round(level * level * 0.8 + level * 18));
+  if (Number.isFinite(Number(fallback)) && Number(fallback) > 0) {
+    return Math.max(base, Math.round(Number(fallback) * 1.12));
+  }
+  return base;
+}
+
 export function BattleScene({
   visible,
   mode,
@@ -119,12 +144,17 @@ export function BattleScene({
   const mountedRef = useRef(true);
   const actionLockRef = useRef(false);
   const attackCountRef = useRef(0);
+  const displayPlayerTeamRef = useRef<BattleTeam>([]);
+  const displayEnemyTeamRef = useRef<BattleTeam>([]);
+  const displayPlayerActiveRef = useRef(initialPlayerIndex);
+  const displayEnemyActiveRef = useRef(initialEnemyIndex);
   const pendingResolutionRef = useRef<{
     result: "ongoing" | "victory" | "defeat" | "ran";
     playerTeam: BattleTeam;
     enemyTeam: BattleTeam;
     playerActive: number;
     enemyActive: number;
+    fieldState: BattleFieldState;
   } | null>(null);
 
   const [playerTeam, setPlayerTeam] = useState<BattleTeam>([]);
@@ -152,6 +182,12 @@ export function BattleScene({
   const [partyOpen, setPartyOpen] = useState(false);
   const [flash] = useState(new Animated.Value(0));
   const flashOverlayOpacity = useRef(new Animated.Value(0)).current;
+  const captureBallOpacity = useRef(new Animated.Value(0)).current;
+  const captureBallX = useRef(new Animated.Value(0)).current;
+  const captureBallY = useRef(new Animated.Value(0)).current;
+  const captureBallScale = useRef(new Animated.Value(0.7)).current;
+  const captureBeamOpacity = useRef(new Animated.Value(0)).current;
+  const captureBeamScale = useRef(new Animated.Value(0.8)).current;
   const cameraX = useRef(new Animated.Value(0)).current;
   const cameraY = useRef(new Animated.Value(0)).current;
   const cameraIdleY = useRef(new Animated.Value(0)).current;
@@ -179,9 +215,9 @@ export function BattleScene({
     const remote = battleAssets || {};
     const pick = (remoteValue: unknown, localValue: unknown) => {
       const r = String(remoteValue || "").trim();
-      if (r) return r;
+      if (isUsableAssetUri(r)) return r;
       const l = String(localValue || "").trim();
-      return l || null;
+      return isUsableAssetUri(l) ? l : null;
     };
     return {
       skyDay: pick(remote.skyDay, local.skyDay),
@@ -277,8 +313,14 @@ export function BattleScene({
       fxTravelX.stopAnimation();
       fxTravelY.stopAnimation();
       flashOverlayOpacity.stopAnimation();
+      captureBallOpacity.stopAnimation();
+      captureBallX.stopAnimation();
+      captureBallY.stopAnimation();
+      captureBallScale.stopAnimation();
+      captureBeamOpacity.stopAnimation();
+      captureBeamScale.stopAnimation();
     };
-  }, [anim, cameraIdleY, cameraScale, cameraX, cameraY, flashOverlayOpacity, fxOpacity, fxTravelX, fxTravelY, parallaxDrift, weatherDriftY]);
+  }, [anim, cameraIdleY, cameraScale, cameraX, cameraY, captureBallOpacity, captureBallScale, captureBallX, captureBallY, captureBeamOpacity, captureBeamScale, flashOverlayOpacity, fxOpacity, fxTravelX, fxTravelY, parallaxDrift, weatherDriftY]);
 
   useEffect(() => {
     if (!visible) return;
@@ -376,7 +418,10 @@ export function BattleScene({
     const raw = src.slice(i + marker.length).replace(/!/g, "").trim();
     const token = moveToken(raw);
     if (!token) return null;
-    const actor = side === "player" ? playerTeam[playerActive] : enemyTeam[enemyActive];
+    const actor =
+      side === "player"
+        ? displayPlayerTeamRef.current[displayPlayerActiveRef.current]
+        : displayEnemyTeamRef.current[displayEnemyActiveRef.current];
     const list = Array.isArray(actor?.moves) ? actor!.moves : [];
     return (
       list.find((mv) => moveToken(String(mv.name || "")) === token) ||
@@ -385,7 +430,29 @@ export function BattleScene({
     );
   };
 
+  const moveFromEvent = (side: "player" | "enemy", ev: BattleTurnEvent): BattleMove | null => {
+    const actor =
+      side === "player"
+        ? displayPlayerTeamRef.current[displayPlayerActiveRef.current]
+        : displayEnemyTeamRef.current[displayEnemyActiveRef.current];
+    const byId = String(ev.moveId || "").trim().toLowerCase();
+    if (byId && actor?.moves?.length) {
+      const exact = actor.moves.find((move) => String(move.id || "").trim().toLowerCase() === byId);
+      if (exact) return exact;
+    }
+    return moveFromAttackText(side, ev.text);
+  };
+
   const waitStep = (duration: number) => wait(Math.max(20, duration));
+
+  const resetCaptureFx = () => {
+    captureBallOpacity.setValue(0);
+    captureBallX.setValue(0);
+    captureBallY.setValue(0);
+    captureBallScale.setValue(0.7);
+    captureBeamOpacity.setValue(0);
+    captureBeamScale.setValue(0.8);
+  };
 
   const runSpawnEffect = async (effect: string, duration: number) => {
     const fx = String(effect || "").toLowerCase();
@@ -429,10 +496,15 @@ export function BattleScene({
     setFxKind("none");
   };
 
-  const playMoveTimeline = async (side: "player" | "enemy", text?: string) => {
+  const playMoveTimeline = async (side: "player" | "enemy", ev: BattleTurnEvent) => {
     sequenceActorSideRef.current = side;
-    const move = moveFromAttackText(side, text);
-    const profile = move ? resolveMoveAnimationProfile(move) : "physical";
+    const move = moveFromEvent(side, ev);
+    const profile: MoveAnimationProfile =
+      ev.moveStage === "charge"
+        ? "charging"
+        : move
+        ? resolveMoveAnimationProfile(move)
+        : "physical";
     const sequence = buildMoveAnimationSequence(profile);
     timelineHandledHitRef.current = sequence.some((step) => step.type === "targetHit" || step.type === "cameraShake");
     await BattleAnimationEngine.playMoveSequence(sequence, {
@@ -495,6 +567,72 @@ export function BattleScene({
     });
   };
 
+  const playCaptureAnimation = async (success: boolean) => {
+    resetCaptureFx();
+    await focusOnEnemy(110);
+    await new Promise<void>((resolve) => {
+      Animated.sequence([
+        Animated.parallel([
+          Animated.timing(captureBallOpacity, { toValue: 1, duration: 50, useNativeDriver: true }),
+          Animated.timing(captureBallScale, { toValue: 1, duration: 120, useNativeDriver: true }),
+          Animated.timing(captureBallX, { toValue: 112, duration: 240, useNativeDriver: true }),
+          Animated.timing(captureBallY, { toValue: -138, duration: 240, useNativeDriver: true }),
+        ]),
+        Animated.parallel([
+          Animated.timing(captureBeamOpacity, { toValue: 1, duration: 110, useNativeDriver: true }),
+          Animated.timing(captureBeamScale, { toValue: 1.45, duration: 180, useNativeDriver: true }),
+          Animated.timing(captureBallScale, { toValue: 1.16, duration: 120, useNativeDriver: true }),
+        ]),
+        Animated.parallel([
+          Animated.timing(captureBeamOpacity, { toValue: 0, duration: 170, useNativeDriver: true }),
+          Animated.timing(captureBallScale, { toValue: 0.92, duration: 170, useNativeDriver: true }),
+          Animated.timing(anim.enemyY, { toValue: success ? -34 : -10, duration: 170, useNativeDriver: true }),
+          Animated.timing(anim.enemyScale, { toValue: success ? 0.2 : 0.82, duration: 170, useNativeDriver: true }),
+          Animated.timing(anim.enemyOpacity, { toValue: success ? 0 : 0.46, duration: 170, useNativeDriver: true }),
+        ]),
+        Animated.parallel([
+          Animated.timing(captureBallY, { toValue: -126, duration: 120, useNativeDriver: true }),
+          Animated.timing(captureBallScale, { toValue: 1.02, duration: 120, useNativeDriver: true }),
+        ]),
+        Animated.parallel([
+          Animated.timing(captureBallY, { toValue: -138, duration: 120, useNativeDriver: true }),
+          Animated.timing(captureBallScale, { toValue: 0.96, duration: 120, useNativeDriver: true }),
+          Animated.timing(anim.enemyOpacity, { toValue: success ? 0 : 0.25, duration: 120, useNativeDriver: true }),
+        ]),
+      ]).start(() => resolve());
+    });
+
+    if (!success) {
+      await new Promise<void>((resolve) => {
+        Animated.parallel([
+          Animated.timing(anim.enemyOpacity, { toValue: 1, duration: 170, useNativeDriver: true }),
+          Animated.timing(anim.enemyScale, { toValue: 1, duration: 170, useNativeDriver: true }),
+          Animated.timing(anim.enemyY, { toValue: 0, duration: 170, useNativeDriver: true }),
+          Animated.timing(captureBallOpacity, { toValue: 0, duration: 140, useNativeDriver: true }),
+          Animated.timing(captureBallScale, { toValue: 0.78, duration: 140, useNativeDriver: true }),
+        ]).start(() => resolve());
+      });
+    }
+
+    await resetCamera();
+  };
+
+  useEffect(() => {
+    displayPlayerTeamRef.current = playerTeam;
+  }, [playerTeam]);
+
+  useEffect(() => {
+    displayEnemyTeamRef.current = enemyTeam;
+  }, [enemyTeam]);
+
+  useEffect(() => {
+    displayPlayerActiveRef.current = playerActive;
+  }, [playerActive]);
+
+  useEffect(() => {
+    displayEnemyActiveRef.current = enemyActive;
+  }, [enemyActive]);
+
   useEffect(() => {
     if (!visible || !flags.enableBattleCamera) return;
     const idleLoop = Animated.loop(
@@ -520,6 +658,10 @@ export function BattleScene({
     setEnemyTeam(e);
     setPlayerActive(initialPlayerIndex);
     setEnemyActive(initialEnemyIndex);
+    displayPlayerTeamRef.current = p;
+    displayEnemyTeamRef.current = e;
+    displayPlayerActiveRef.current = initialPlayerIndex;
+    displayEnemyActiveRef.current = initialEnemyIndex;
     setParticipants(active?.slotIndex ? [active.slotIndex] : []);
     setMessage(ptBR.escolherAcao(active?.name || "Pokemon"));
     setBusy(false);
@@ -557,6 +699,7 @@ export function BattleScene({
     fxTravelX.setValue(0);
     fxTravelY.setValue(0);
     flashOverlayOpacity.setValue(0);
+    resetCaptureFx();
     anim.resetOpacity("player");
     anim.resetOpacity("enemy");
     anim.playerHpAnim.setValue(active ? active.hpCurrent / Math.max(1, active.hpTotal) : 1);
@@ -591,14 +734,27 @@ export function BattleScene({
       if (ev.type === "attack") {
         attackCountRef.current += 1;
         setPhase(attackCountRef.current === 1 ? "EXECUTE_FIRST_ACTION" : "EXECUTE_SECOND_ACTION");
+        if (ev.moveStage === "execute" && ev.side && ev.semiInvulnerablePhase) {
+          await anim.animateSemiInvulnerableExit(ev.side);
+        }
         if (ev.side) {
           if (flags.enableBattleTimeline) {
-            await playMoveTimeline(ev.side, ev.text);
-            await wait(70);
+            await playMoveTimeline(ev.side, ev);
+            await wait(280);
           } else {
             await focusOnTarget(ev.side, 130);
-            if (flags.enableBattleSpriteReactions) await anim.animateAttack(ev.side);
-            await wait(170);
+            if (flags.enableBattleSpriteReactions) {
+              if (ev.moveStage === "charge" && ev.semiInvulnerablePhase) {
+                await anim.animateCast(ev.side);
+              } else {
+                await anim.animateAttack(ev.side);
+              }
+            }
+            await wait(360);
+          }
+          if (ev.moveStage === "charge" && ev.semiInvulnerablePhase) {
+            await anim.animateSemiInvulnerableEnter(ev.side, ev.semiInvulnerablePhase);
+            await wait(120);
           }
         }
         continue;
@@ -606,7 +762,7 @@ export function BattleScene({
       if (ev.type === "hit") {
         if (flags.enableBattleTimeline && timelineHandledHitRef.current) {
           timelineHandledHitRef.current = false;
-          await wait(60);
+          await wait(180);
           continue;
         }
         if (ev.side && flags.enableBattleSpriteReactions) await anim.animateHit(ev.side);
@@ -614,10 +770,19 @@ export function BattleScene({
         if (isCriticalHit) await playCriticalShake();
         else await playHitShake();
         await resetCamera();
-        await wait(130);
+        await wait(780);
         continue;
       }
       if (ev.type === "switch" && ev.side) {
+        if (typeof ev.activeIndex === "number" && ev.activeIndex >= 0) {
+          if (ev.side === "player") {
+            displayPlayerActiveRef.current = ev.activeIndex;
+            setPlayerActive(ev.activeIndex);
+          } else {
+            displayEnemyActiveRef.current = ev.activeIndex;
+            setEnemyActive(ev.activeIndex);
+          }
+        }
         if (flags.enableBattleSpriteReactions) {
           const t = String(ev.text || "").toLowerCase();
           if (t.includes("voltou")) await anim.animateSwitch(ev.side);
@@ -629,22 +794,196 @@ export function BattleScene({
       if (ev.type === "hp" && ev.side != null) {
         const pct = (ev.hpCurrent || 0) / Math.max(1, ev.hpTotal || 1);
         await anim.animateHp(ev.side, pct);
-        await wait(120);
+        if (ev.side === "player") {
+          const idx = displayPlayerActiveRef.current;
+          const next = displayPlayerTeamRef.current.map((mon, monIndex) =>
+            monIndex === idx
+              ? {
+                ...mon,
+                hpCurrent: Math.max(0, Number(ev.hpCurrent ?? mon.hpCurrent)),
+                hpTotal: Math.max(1, Number(ev.hpTotal ?? mon.hpTotal)),
+              }
+              : mon
+          );
+          displayPlayerTeamRef.current = next;
+          setPlayerTeam(next);
+        } else {
+          const idx = displayEnemyActiveRef.current;
+          const next = displayEnemyTeamRef.current.map((mon, monIndex) =>
+            monIndex === idx
+              ? {
+                ...mon,
+                hpCurrent: Math.max(0, Number(ev.hpCurrent ?? mon.hpCurrent)),
+                hpTotal: Math.max(1, Number(ev.hpTotal ?? mon.hpTotal)),
+              }
+              : mon
+          );
+          displayEnemyTeamRef.current = next;
+          setEnemyTeam(next);
+        }
+        await wait(420);
+        continue;
+      }
+      if (ev.type === "status" && ev.side != null) {
+        if (ev.side === "player") {
+          const idx = displayPlayerActiveRef.current;
+          const next = displayPlayerTeamRef.current.map((mon, monIndex) =>
+            monIndex === idx ? { ...mon, status: ev.status || "none" } : mon
+          );
+          displayPlayerTeamRef.current = next;
+          setPlayerTeam(next);
+        } else {
+          const idx = displayEnemyActiveRef.current;
+          const next = displayEnemyTeamRef.current.map((mon, monIndex) =>
+            monIndex === idx ? { ...mon, status: ev.status || "none" } : mon
+          );
+          displayEnemyTeamRef.current = next;
+          setEnemyTeam(next);
+        }
+        await wait(180);
+        continue;
+      }
+      if (ev.type === "weather") {
+        setFieldState((prev) => ({
+          ...prev,
+          weather: ev.weather || prev.weather,
+          weatherTurns: Math.max(0, Number(ev.weatherTurns ?? prev.weatherTurns)),
+        }));
+        await wait(900);
         continue;
       }
       if (ev.type === "faint" && ev.side) {
         await anim.animateFaint(ev.side);
-        await wait(220);
+        await wait(900);
         continue;
       }
-      await wait(180);
+      await wait(900);
     }
     await resetCamera();
+  }
+
+  async function queueAutomaticCommittedTurn(args: {
+    playerTeam: BattleTeam;
+    enemyTeam: BattleTeam;
+    playerActive: number;
+    enemyActive: number;
+    fieldState: BattleFieldState;
+  }) {
+    const currentPlayer = args.playerTeam[args.playerActive];
+    const chargingMoveId = String(currentPlayer?.chargingMoveId || "").trim().toLowerCase();
+    if (!currentPlayer || currentPlayer.hpCurrent <= 0 || !chargingMoveId) return false;
+
+    const moveIndex = currentPlayer.moves.findIndex((move) => String(move.id || "").trim().toLowerCase() === chargingMoveId);
+    const lockedMove = moveIndex >= 0 ? currentPlayer.moves[moveIndex] : null;
+    setMessage(lockedMove ? `${currentPlayer.name} continua ${lockedMove.name}!` : `${currentPlayer.name} continua o movimento!`);
+    setPhase("ENEMY_CHOOSE");
+
+    const resolution = resolveTurn({
+      playerTeam: args.playerTeam,
+      enemyTeam: args.enemyTeam,
+      playerActive: args.playerActive,
+      enemyActive: args.enemyActive,
+      playerAction: { type: "fight", moveIndex: moveIndex >= 0 ? moveIndex : 0 },
+      enemyAction: randomEnemyAction(),
+      canRun,
+      isForcedPlayerSwitch: false,
+      typeMultiplier,
+      fieldState: args.fieldState,
+    });
+
+    if (!mountedRef.current) return true;
+    setPhase("RESOLVE_ORDER");
+    pendingResolutionRef.current = {
+      result: resolution.result,
+      playerTeam: resolution.playerTeam,
+      enemyTeam: resolution.enemyTeam,
+      playerActive: resolution.playerActive,
+      enemyActive: resolution.enemyActive,
+      fieldState: resolution.fieldState,
+    };
+    if (resolution.events.length === 0) {
+      await finishTurnFlow();
+    } else {
+      setEventQueue(resolution.events);
+    }
+    return true;
+  }
+
+  async function playVictoryExpFlow(args: {
+    playerTeam: BattleTeam;
+    enemyTeam: BattleTeam;
+    participants: number[];
+  }) {
+    const defeatedEnemies = args.enemyTeam.filter((enemy) => enemy.hpCurrent <= 0);
+    if (!defeatedEnemies.length) return args.playerTeam;
+
+    const eligible = args.playerTeam.filter((mon) =>
+      mon.slotIndex != null &&
+      args.participants.includes(Number(mon.slotIndex)) &&
+      mon.hpTotal > 0
+    );
+    if (!eligible.length) return args.playerTeam;
+
+    const totalExp = defeatedEnemies.reduce((sum, enemy) => sum + estimateEnemyExpYield(enemy), 0);
+    const expPerMon = Math.max(1, Math.floor(totalExp / eligible.length));
+    let nextTeam = args.playerTeam.map((mon) => ({ ...mon }));
+
+    for (const mon of eligible) {
+      const teamIndex = nextTeam.findIndex((row) => row.slotIndex === mon.slotIndex);
+      if (teamIndex < 0) continue;
+      let current = { ...nextTeam[teamIndex] };
+      let remaining = expPerMon;
+      let threshold = Math.max(1, Number(current.expToNext || nextExpThreshold(current.level)));
+      let currentExp = Math.max(0, Number(current.expCurrent || 0));
+
+      setMessage(`${current.name} ganhou ${expPerMon} de EXP!`);
+      await wait(950);
+
+      while (remaining > 0) {
+        const needed = Math.max(1, threshold - currentExp);
+        const gain = Math.min(remaining, needed);
+        currentExp += gain;
+        remaining -= gain;
+        current = { ...current, expCurrent: currentExp, expToNext: threshold, expTotal: Math.max(0, Number(current.expTotal || 0)) + gain };
+        nextTeam[teamIndex] = current;
+        displayPlayerTeamRef.current = nextTeam;
+        setPlayerTeam(nextTeam);
+        await wait(520);
+
+        if (currentExp >= threshold && remaining >= 0) {
+          current = {
+            ...current,
+            level: current.level + 1,
+            expCurrent: 0,
+            expToNext: nextExpThreshold(current.level + 1, threshold),
+          };
+          currentExp = 0;
+          threshold = Math.max(1, Number(current.expToNext || threshold));
+          nextTeam[teamIndex] = current;
+          displayPlayerTeamRef.current = nextTeam;
+          setPlayerTeam(nextTeam);
+          setMessage(`${current.name} subiu para o nivel ${current.level}!`);
+          await wait(1100);
+        }
+      }
+    }
+
+    return nextTeam;
   }
 
   async function finishTurnFlow() {
     const pending = pendingResolutionRef.current;
     if (!pending || !mountedRef.current) return;
+
+    setPlayerTeam(pending.playerTeam);
+    setEnemyTeam(pending.enemyTeam);
+    setPlayerActive(pending.playerActive);
+    setEnemyActive(pending.enemyActive);
+    setFieldState(pending.fieldState);
+    displayPlayerTeamRef.current = pending.playerTeam;
+    displayEnemyTeamRef.current = pending.enemyTeam;
+    displayPlayerActiveRef.current = pending.playerActive;
+    displayEnemyActiveRef.current = pending.enemyActive;
 
     if (pending.result === "ongoing") {
       setPhase("END_TURN");
@@ -659,6 +998,17 @@ export function BattleScene({
         setBusy(false);
         actionLockRef.current = false;
         pendingResolutionRef.current = null;
+        return;
+      }
+
+      const consumedAutomaticTurn = await queueAutomaticCommittedTurn({
+        playerTeam: pending.playerTeam,
+        enemyTeam: pending.enemyTeam,
+        playerActive: pending.playerActive,
+        enemyActive: pending.enemyActive,
+        fieldState: pending.fieldState,
+      });
+      if (consumedAutomaticTurn) {
         return;
       }
 
@@ -680,10 +1030,21 @@ export function BattleScene({
     }
 
     setPhase("END_TURN");
+    let finalPlayerTeam = pending.playerTeam;
+    if (pending.result === "victory") {
+      finalPlayerTeam = await playVictoryExpFlow({
+        playerTeam: pending.playerTeam,
+        enemyTeam: pending.enemyTeam,
+        participants,
+      });
+      if (!mountedRef.current) return;
+      setPlayerTeam(finalPlayerTeam);
+      displayPlayerTeamRef.current = finalPlayerTeam;
+    }
     setResult(pending.result);
     await onFinish?.({
       result: pending.result,
-      playerTeam: pending.playerTeam,
+      playerTeam: finalPlayerTeam,
       enemyTeam: pending.enemyTeam,
       playerActive: pending.playerActive,
       enemyActive: pending.enemyActive,
@@ -752,23 +1113,20 @@ export function BattleScene({
         playerAction,
         enemyAction: randomEnemyAction(),
         canRun,
+        isForcedPlayerSwitch: phase === "FORCED_SWITCH",
         typeMultiplier,
         fieldState,
       });
 
       if (!mountedRef.current) return;
       setPhase("RESOLVE_ORDER");
-      setPlayerTeam(resolution.playerTeam);
-      setEnemyTeam(resolution.enemyTeam);
-      setPlayerActive(resolution.playerActive);
-      setEnemyActive(resolution.enemyActive);
-      setFieldState(resolution.fieldState);
       pendingResolutionRef.current = {
         result: resolution.result,
         playerTeam: resolution.playerTeam,
         enemyTeam: resolution.enemyTeam,
         playerActive: resolution.playerActive,
         enemyActive: resolution.enemyActive,
+        fieldState: resolution.fieldState,
       };
       if (resolution.events.length === 0) {
         await finishTurnFlow();
@@ -790,10 +1148,14 @@ export function BattleScene({
     if (result !== "ongoing" || phase !== "PLAYER_CHOOSE" || busy || actionLockRef.current) return;
     actionLockRef.current = true;
     setBusy(true);
+    const ballLabel = balls.find((item) => item.id === ballId)?.name || "Pokebola";
+    setMessage(`${ballLabel}, vai!`);
+    await playCaptureAnimation(false);
     const out = await onTryCapture(ballId, activeEnemy);
     if (!mountedRef.current) return;
     setMessage(out.message);
     if (out.ok) {
+      await playCaptureAnimation(true);
       setResult("victory");
       setPhase("END_TURN");
       await onFinish?.({
@@ -807,6 +1169,7 @@ export function BattleScene({
       if (!mountedRef.current) return;
       setPhase("IDLE");
     } else {
+      resetCaptureFx();
       setPhase("PLAYER_CHOOSE");
     }
     setBusy(false);
@@ -860,6 +1223,9 @@ export function BattleScene({
     (isNight ? effectiveBattleAssets?.platformEnemyNight : null) || effectiveBattleAssets?.platformEnemy || ""
   ).trim() || null;
   const hasCustomBg = !!(skyAssetUri || backgroundAssetUri || groundAssetUri);
+  const usingBackdropScene = !!backgroundAssetUri && !skyAssetUri && !groundAssetUri;
+  const hasExplicitPlatforms = !!(playerPlatformUri || enemyPlatformUri);
+  const showGroundLine = !!groundAssetUri || hasExplicitPlatforms;
   const weatherVisualMode = weatherToVisualMode(fieldState.weather);
   const rainDrops = useMemo(
     () =>
@@ -957,26 +1323,44 @@ export function BattleScene({
                     resizeMode="cover"
                   />
                 ) : null}
-                {hasCustomBg ? <View style={styles.customBgShade} /> : null}
-                <View style={styles.skyGlow} />
+                {hasCustomBg ? (
+                  <View style={[styles.customBgShade, usingBackdropScene ? styles.customBgShadeScene : null]} />
+                ) : null}
+                <LinearGradient
+                  pointerEvents="none"
+                  colors={
+                    usingBackdropScene
+                      ? ["rgba(255,255,255,0.08)", "rgba(255,255,255,0.02)", "rgba(0,0,0,0.08)"]
+                      : ["rgba(255,255,255,0.12)", "rgba(255,255,255,0.03)", "rgba(0,0,0,0.10)"]
+                  }
+                  locations={[0, 0.42, 1]}
+                  style={styles.atmosphereGlow}
+                />
+                <LinearGradient
+                  pointerEvents="none"
+                  colors={usingBackdropScene ? ["rgba(3,7,18,0)", "rgba(3,7,18,0.32)", "rgba(3,7,18,0.62)"] : ["rgba(3,7,18,0)", "rgba(3,7,18,0.22)", "rgba(3,7,18,0.46)"]}
+                  locations={[0, 0.68, 1]}
+                  style={styles.floorDepth}
+                />
                 <View style={styles.vignette} />
 
                 <View style={styles.spritesLayer}>
-                  <View style={styles.groundLine} />
+                  {showGroundLine ? <View style={styles.groundLine} /> : null}
                   {playerPlatformUri ? (
                     <Image source={{ uri: playerPlatformUri }} style={styles.playerGroundAsset} resizeMode="contain" />
                   ) : (
-                    <View style={styles.playerGround} />
+                    <View style={[styles.playerGround, usingBackdropScene ? styles.playerGroundScene : null]} />
                   )}
                   {enemyPlatformUri ? (
                     <Image source={{ uri: enemyPlatformUri }} style={styles.enemyGroundAsset} resizeMode="contain" />
                   ) : (
-                    <View style={styles.enemyGround} />
+                    <View style={[styles.enemyGround, usingBackdropScene ? styles.enemyGroundScene : null]} />
                   )}
                   <View
                     pointerEvents="none"
                     style={[
                       styles.enemyContactShadow,
+                      usingBackdropScene ? styles.enemyContactShadowScene : null,
                       { transform: [{ scaleX: enemyShadowScale }, { scaleY: Math.max(0.7, enemyShadowScale * 0.82) }] },
                     ]}
                   />
@@ -984,6 +1368,7 @@ export function BattleScene({
                     pointerEvents="none"
                     style={[
                       styles.playerContactShadow,
+                      usingBackdropScene ? styles.playerContactShadowScene : null,
                       { transform: [{ scaleX: playerShadowScale }, { scaleY: Math.max(0.7, playerShadowScale * 0.84) }] },
                     ]}
                   />
@@ -991,6 +1376,8 @@ export function BattleScene({
                   <Animated.View
                     style={[
                       styles.enemySpriteWrap,
+                      usingBackdropScene ? styles.enemySpriteWrapScene : null,
+                      { opacity: anim.enemyOpacity },
                       {
                         transform: [
                           { translateX: anim.enemyX },
@@ -1018,6 +1405,8 @@ export function BattleScene({
                   <Animated.View
                     style={[
                       styles.playerSpriteWrap,
+                      usingBackdropScene ? styles.playerSpriteWrapScene : null,
+                      { opacity: anim.playerOpacity },
                       {
                         transform: [
                           { translateX: anim.playerX },
@@ -1061,6 +1450,30 @@ export function BattleScene({
                     ) : null}
                   </View>
                 ) : null}
+                <Animated.View
+                  pointerEvents="none"
+                  style={[
+                    styles.captureBeam,
+                    {
+                      opacity: captureBeamOpacity,
+                      transform: [{ scale: captureBeamScale }],
+                    },
+                  ]}
+                />
+                <Animated.View
+                  pointerEvents="none"
+                  style={[
+                    styles.captureBall,
+                    {
+                      opacity: captureBallOpacity,
+                      transform: [{ translateX: captureBallX }, { translateY: captureBallY }, { scale: captureBallScale }],
+                    },
+                  ]}
+                >
+                  <View style={styles.captureBallTop} />
+                  <View style={styles.captureBallCenter} />
+                  <View style={styles.captureBallBottom} />
+                </Animated.View>
                 {flashOverlayVariant !== "none" ? (
                   <Animated.View
                     pointerEvents="none"
@@ -1149,6 +1562,14 @@ export function BattleScene({
                     hpCurrent={activeEnemy.hpCurrent}
                     hpTotal={activeEnemy.hpTotal}
                     side="enemy"
+                    status={activeEnemy.status}
+                    atkStage={activeEnemy.atkStage}
+                    defStage={activeEnemy.defStage}
+                    spaStage={activeEnemy.spaStage}
+                    spdStage={activeEnemy.spdStage}
+                    speStage={activeEnemy.speStage}
+                    accuracyStage={activeEnemy.accuracyStage}
+                    evasionStage={activeEnemy.evasionStage}
                   />
                 ) : null}
               </View>
@@ -1160,6 +1581,17 @@ export function BattleScene({
                     hpCurrent={activePlayer.hpCurrent}
                     hpTotal={activePlayer.hpTotal}
                     side="player"
+                    status={activePlayer.status}
+                    expCurrent={activePlayer.expCurrent}
+                    expToNext={activePlayer.expToNext}
+                    showExpBar
+                    atkStage={activePlayer.atkStage}
+                    defStage={activePlayer.defStage}
+                    spaStage={activePlayer.spaStage}
+                    spdStage={activePlayer.spdStage}
+                    speStage={activePlayer.speStage}
+                    accuracyStage={activePlayer.accuracyStage}
+                    evasionStage={activePlayer.evasionStage}
                     showNumericHp
                   />
                 ) : null}
@@ -1235,13 +1667,21 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.18)",
     zIndex: 3,
   },
-  skyGlow: {
+  customBgShadeScene: {
+    backgroundColor: "rgba(0,0,0,0.08)",
+  },
+  atmosphereGlow: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(255,255,255,0.06)",
+    zIndex: 3,
+  },
+  floorDepth: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 4,
   },
   vignette: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: "rgba(0,0,0,0.16)",
+    zIndex: 4,
   },
   flash: { ...StyleSheet.absoluteFillObject, backgroundColor: "#fff" },
   scene: { flex: 1, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6, zIndex: 5 },
@@ -1305,22 +1745,38 @@ const styles = StyleSheet.create({
   playerGround: {
     position: "absolute",
     left: "8%",
-    bottom: 36,
-    width: "34%",
+    bottom: 34,
+    width: "36%",
     maxWidth: 170,
-    height: 18,
+    height: 20,
     borderRadius: 999,
-    backgroundColor: "rgba(0,0,0,0.24)",
+    backgroundColor: "rgba(3,7,18,0.34)",
   },
   enemyGround: {
     position: "absolute",
     right: "8%",
-    bottom: 100,
+    bottom: 102,
+    width: "31%",
+    maxWidth: 150,
+    height: 18,
+    borderRadius: 999,
+    backgroundColor: "rgba(3,7,18,0.30)",
+  },
+  playerGroundScene: {
+    left: "11%",
+    bottom: 38,
     width: "30%",
     maxWidth: 150,
     height: 16,
-    borderRadius: 999,
-    backgroundColor: "rgba(0,0,0,0.22)",
+    backgroundColor: "rgba(2,6,23,0.22)",
+  },
+  enemyGroundScene: {
+    right: "13%",
+    bottom: 124,
+    width: "22%",
+    maxWidth: 108,
+    height: 14,
+    backgroundColor: "rgba(2,6,23,0.18)",
   },
   playerGroundAsset: {
     position: "absolute",
@@ -1358,6 +1814,20 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     backgroundColor: "rgba(0,0,0,0.28)",
   },
+  enemyContactShadowScene: {
+    right: "14%",
+    bottom: 139,
+    width: "15%",
+    maxWidth: 62,
+    backgroundColor: "rgba(2,6,23,0.18)",
+  },
+  playerContactShadowScene: {
+    left: "16%",
+    bottom: 53,
+    width: "18%",
+    maxWidth: 88,
+    backgroundColor: "rgba(2,6,23,0.20)",
+  },
   enemySpriteWrap: {
     position: "absolute",
     right: 8,
@@ -1368,6 +1838,10 @@ const styles = StyleSheet.create({
     justifyContent: "flex-end",
     alignItems: "center",
   },
+  enemySpriteWrapScene: {
+    right: 14,
+    bottom: 104,
+  },
   playerSpriteWrap: {
     position: "absolute",
     left: 1,
@@ -1377,6 +1851,10 @@ const styles = StyleSheet.create({
     height: 260,
     justifyContent: "flex-end",
     alignItems: "center",
+  },
+  playerSpriteWrapScene: {
+    left: 8,
+    bottom: -2,
   },
   enemySprite: { width: "96%", height: "96%" },
   playerSprite: { width: "100%", height: "100%" },
@@ -1413,6 +1891,47 @@ const styles = StyleSheet.create({
     shadowColor: "#fff",
     shadowOpacity: 0.55,
     shadowRadius: 12,
+  },
+  captureBeam: {
+    position: "absolute",
+    right: "18%",
+    bottom: 136,
+    width: 88,
+    height: 88,
+    borderRadius: 999,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.75)",
+    backgroundColor: "rgba(125,211,252,0.18)",
+    zIndex: 8,
+  },
+  captureBall: {
+    position: "absolute",
+    left: "29%",
+    bottom: 64,
+    width: 26,
+    height: 26,
+    borderRadius: 999,
+    overflow: "hidden",
+    borderWidth: 2,
+    borderColor: "#111827",
+    backgroundColor: "#fff",
+    zIndex: 9,
+  },
+  captureBallTop: {
+    height: "48%",
+    backgroundColor: "#ef4444",
+  },
+  captureBallCenter: {
+    position: "absolute",
+    top: "42%",
+    left: 0,
+    right: 0,
+    height: 4,
+    backgroundColor: "#111827",
+  },
+  captureBallBottom: {
+    flex: 1,
+    backgroundColor: "#f8fafc",
   },
   flashOverlay: {
     ...StyleSheet.absoluteFillObject,

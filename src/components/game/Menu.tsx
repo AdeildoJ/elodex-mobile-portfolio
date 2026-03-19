@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { COLORS } from "../../theme/colors";
 import type { GameActionKey } from "./types";
@@ -17,107 +17,77 @@ type Props = {
   onChange: (key: GameActionKey) => void;
 };
 
-// 🔥 ÍCONES GRANDES (ajuste aqui se quiser ainda maior)
-const ICON_INACTIVE = 34;
-const ICON_ACTIVE = 42;
-
-// barra mais alta (melhor leitura)
-const BAR_H = 92;
-
 type NavItem = {
   key: GameActionKey;
-  label: string;
-  Icon: any;
+  Icon: typeof Backpack;
 };
 
+const BAR_HEIGHT = 58;
+const ACTIVE_SIZE = 58;
+
 export function GameMenu({ activeAction, onChange }: Props) {
-  // Mantemos os labels em PT-BR, mas com chaves internas canônicas.
-  const isPT = true;
+  const nav: NavItem[] = useMemo(
+    () => [
+      { key: "BAG" as GameActionKey, Icon: Backpack },
+      { key: "EXPLORE" as GameActionKey, Icon: Compass },
+      { key: "BATTLES" as GameActionKey, Icon: Swords },
+      { key: "SHOP" as GameActionKey, Icon: ShoppingBag },
+      { key: "EVENTS" as GameActionKey, Icon: CalendarDays },
+    ],
+    []
+  );
 
-  const nav: NavItem[] = useMemo(() => {
-    if (isPT) {
-      return [
-        { key: "BAG" as GameActionKey, label: "Mochila", Icon: Backpack },
-        { key: "EXPLORE" as GameActionKey, label: "Explorar", Icon: Compass },
-        { key: "BATTLES" as GameActionKey, label: "Batalhas", Icon: Swords },
-        { key: "SHOP" as GameActionKey, label: "Loja", Icon: ShoppingBag },
-        { key: "EVENTS" as GameActionKey, label: "Eventos", Icon: CalendarDays },
-      ];
-    }
-
-    // fallback EN (caso seu GameActionKey esteja em inglês no HUB)
-    return [
-      { key: "BAG" as GameActionKey, label: "Bag", Icon: Backpack },
-      { key: "EXPLORE" as GameActionKey, label: "Explore", Icon: Compass },
-      { key: "BATTLES" as GameActionKey, label: "Battles", Icon: Swords },
-      { key: "SHOP" as GameActionKey, label: "Shop", Icon: ShoppingBag },
-      { key: "EVENTS" as GameActionKey, label: "Events", Icon: CalendarDays },
-    ];
-  }, [isPT]);
+  const activeIndex = Math.max(0, nav.findIndex((item) => String(item.key) === String(activeAction)));
+  const activeCenterStyle = { left: `${((activeIndex + 0.5) / nav.length) * 100}%` as any };
+  const ActiveIcon = nav[activeIndex]?.Icon ?? Backpack;
 
   return (
     <View style={styles.wrap} pointerEvents="box-none">
-      <View style={styles.bar}>
-        {/* Glass / HUD base */}
-        <LinearGradient
-          colors={["rgba(255,255,255,0.10)", "rgba(255,255,255,0.04)"]}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 1 }}
-          style={StyleSheet.absoluteFillObject}
-        />
+      <View style={styles.shell}>
+        <View style={styles.shadowPlate} />
 
-        {/* “Traço rico” superior */}
-        <View style={styles.hairlineTop} />
+        <View style={styles.barWrap}>
+          <View style={styles.leftCap} />
+          <View style={styles.rightCap} />
 
-        {/* Conteúdo */}
-        <View style={styles.row}>
-          {nav.map((item) => {
-            const isActive = String(item.key) === String(activeAction);
-            const IconComp = item.Icon;
+          <View style={styles.bar}>
+            <View style={[styles.notchSeat, activeCenterStyle]} />
 
-            return (
-              <Pressable
-                key={String(item.key)}
-                onPress={() => onChange(item.key)}
-                style={({ pressed }) => [
-                  styles.slot,
-                  pressed && { opacity: 0.9 },
-                ]}
-              >
-                {/* “Chip” ativo (diferencial forte, mas minimalista) */}
-                <View style={[styles.chip, isActive && styles.chipActive]}>
-                  {/* brilho do ativo */}
-                  {isActive && (
-                    <LinearGradient
-                      colors={[
-                        "rgba(59,130,246,0.35)",
-                        "rgba(167,139,250,0.22)",
-                        "rgba(255,255,255,0.00)",
-                      ]}
-                      start={{ x: 0.2, y: 0 }}
-                      end={{ x: 0.8, y: 1 }}
-                      style={styles.activeGlow}
-                    />
-                  )}
+            <View style={styles.row}>
+              {nav.map((item) => {
+                const isActive = String(item.key) === String(activeAction);
+                const IconComp = item.Icon;
 
-                  <IconComp
-                    size={isActive ? ICON_ACTIVE : ICON_INACTIVE}
-                    color={isActive ? COLORS.white : "rgba(255,255,255,0.55)"}
-                    strokeWidth={isActive ? 2.6 : 2.2}
-                  />
-
-                  {/* label opcional (profissional). Se você NÃO quiser texto, eu removo. */}
-                  <Text style={[styles.label, isActive ? styles.labelActive : styles.labelInactive]}>
-                    {item.label}
-                  </Text>
-
-                  {/* underline do ativo */}
-                  <View style={[styles.underline, isActive && styles.underlineActive]} />
-                </View>
-              </Pressable>
-            );
-          })}
+                return (
+                  <Pressable
+                    key={String(item.key)}
+                    onPress={() => onChange(item.key)}
+                    style={({ pressed }) => [styles.slot, pressed ? styles.slotPressed : null]}
+                  >
+                    {isActive ? (
+                      <View style={styles.activeGhost} />
+                    ) : (
+                      <IconComp size={22} color="#FFFFFF" strokeWidth={2.1} />
+                    )}
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
         </View>
+
+        <Pressable onPress={() => onChange(nav[activeIndex]?.key ?? "BAG")} style={[styles.activeButton, activeCenterStyle]}>
+          <View style={styles.activeRing}>
+            <LinearGradient
+              colors={[COLORS.secondary, COLORS.primary]}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.activeFill}
+            >
+              <ActiveIcon size={23} color={COLORS.white} strokeWidth={2.4} />
+            </LinearGradient>
+          </View>
+        </Pressable>
       </View>
     </View>
   );
@@ -128,100 +98,114 @@ const styles = StyleSheet.create({
     position: "absolute",
     left: 0,
     right: 0,
-    bottom: 24,
+    bottom: 46,
     alignItems: "center",
   },
-
-  bar: {
-    width: "94%",
-    height: BAR_H,
-    borderRadius: 30,
-    backgroundColor: "rgba(0,0,0,0.28)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.12)",
-    overflow: "hidden",
-    // sombras
+  shell: {
+    width: "88%",
+    height: 86,
+    justifyContent: "flex-end",
+  },
+  shadowPlate: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+    bottom: 2,
+    height: 52,
+    borderRadius: 18,
+    backgroundColor: "rgba(0,0,0,0.16)",
     shadowColor: "#000",
-    shadowOpacity: 0.35,
+    shadowOpacity: 0.34,
     shadowRadius: 18,
     shadowOffset: { width: 0, height: 12 },
-    elevation: 12,
+    elevation: 14,
   },
-
-  hairlineTop: {
+  barWrap: {
+    position: "relative",
+    justifyContent: "flex-end",
+  },
+  bar: {
+    height: BAR_HEIGHT,
+    borderRadius: 18,
+    backgroundColor: "#05070D",
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+    overflow: "hidden",
+  },
+  leftCap: {
     position: "absolute",
-    top: 0,
-    left: 18,
-    right: 18,
-    height: 1,
-    backgroundColor: "rgba(255,255,255,0.10)",
+    left: 6,
+    bottom: 18,
+    width: 34,
+    height: 20,
+    borderRadius: 8,
+    backgroundColor: "#05070D",
+    transform: [{ skewX: "-28deg" }],
   },
-
+  rightCap: {
+    position: "absolute",
+    right: 6,
+    bottom: 18,
+    width: 18,
+    height: 16,
+    borderRadius: 6,
+    backgroundColor: "#05070D",
+    transform: [{ skewX: "-24deg" }],
+  },
+  notchSeat: {
+    position: "absolute",
+    top: -18,
+    width: 74,
+    height: 34,
+    marginLeft: -37,
+    borderBottomLeftRadius: 28,
+    borderBottomRightRadius: 28,
+    backgroundColor: "#05070D",
+  },
   row: {
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 12,
   },
-
   slot: {
     flex: 1,
     height: "100%",
     alignItems: "center",
     justifyContent: "center",
   },
-
-  chip: {
-    width: 68,
-    height: 66,
-    borderRadius: 22,
+  slotPressed: {
+    opacity: 0.86,
+  },
+  activeGhost: {
+    width: 24,
+    height: 24,
+  },
+  activeButton: {
+    position: "absolute",
+    top: 0,
+    width: ACTIVE_SIZE,
+    height: ACTIVE_SIZE,
+    marginLeft: -(ACTIVE_SIZE / 2),
+  },
+  activeRing: {
+    flex: 1,
+    borderRadius: ACTIVE_SIZE / 2,
+    backgroundColor: "#05070D",
+    padding: 3,
+    borderWidth: 2,
+    borderColor: "#FFFFFF",
+    shadowColor: "#000",
+    shadowOpacity: 0.28,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 10,
+  },
+  activeFill: {
+    flex: 1,
+    borderRadius: 999,
     alignItems: "center",
     justifyContent: "center",
-    gap: 4,
-    backgroundColor: "rgba(255,255,255,0.03)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.06)",
-  },
-
-  chipActive: {
-    backgroundColor: "rgba(255,255,255,0.09)",
-    borderColor: "rgba(255,255,255,0.16)",
-    shadowColor: COLORS.primary,
-    shadowOpacity: 0.35,
-    shadowRadius: 14,
-    shadowOffset: { width: 0, height: 10 },
-    elevation: 10,
-    transform: [{ translateY: -2 }],
-  },
-
-  activeGlow: {
-    position: "absolute",
-    top: -14,
-    left: -14,
-    right: -14,
-    bottom: -14,
-    borderRadius: 28,
-  },
-
-  label: {
-    fontSize: 11,
-    fontWeight: "800",
-    letterSpacing: 0.3,
-  },
-  labelActive: {
-    color: "rgba(255,255,255,0.92)",
-  },
-  labelInactive: {
-    color: "rgba(255,255,255,0.42)",
-  },
-
-  underline: {
-    marginTop: 2,
-    width: 34,
-    height: 3,
-    borderRadius: 2,
-    backgroundColor: "rgba(255,255,255,0.06)",
-  },
-  underlineActive: {
-    backgroundColor: "rgba(255,255,255,0.70)",
   },
 });

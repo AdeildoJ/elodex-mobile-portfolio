@@ -42,6 +42,90 @@ export type BattleFieldState = {
   enemyStealthRock: boolean;
 };
 
+export type BattleMoveEffectTarget = "user" | "target" | "user-side" | "target-side" | "field";
+
+export type BattleMoveExecution = {
+  chargeTurns?: number;
+  hitTurn?: number;
+  skipChargeInWeather?: BattleWeather[];
+  semiInvulnerablePhase?: "airborne" | "underground" | "underwater" | "vanished";
+  multiHit?: {
+    minHits: number;
+    maxHits: number;
+  };
+};
+
+export type BattleMoveEffect =
+  | {
+      kind: "damage";
+      target: "target";
+    }
+  | {
+      kind: "heal";
+      target: "user" | "target";
+      percent: number;
+      phase: "onUse" | "afterDamage";
+    }
+  | {
+      kind: "drain";
+      target: "user";
+      percent: number;
+      phase: "afterDamage";
+    }
+  | {
+      kind: "recoil";
+      target: "user";
+      percent: number;
+      basedOn: "damageDealt";
+      phase: "afterDamage";
+    }
+  | {
+      kind: "status";
+      target: "user" | "target";
+      status: string;
+      chance: number;
+      phase: "onUse" | "onHit";
+    }
+  | {
+      kind: "volatileStatus";
+      target: "user" | "target";
+      status: string;
+      chance: number;
+      phase: "onUse" | "onHit" | "afterDamage";
+    }
+  | {
+      kind: "statStages";
+      target: "user" | "target";
+      chance: number;
+      phase: "onUse" | "onHit";
+      changes: { stat: string; stages: number }[];
+    }
+  | {
+      kind: "weather";
+      target: "field";
+      phase: "onUse";
+      weather: BattleWeather;
+      turns: number;
+    }
+  | {
+      kind: "sideCondition";
+      target: "user-side" | "target-side";
+      phase: "onUse";
+      condition: "reflect" | "light-screen" | "spikes" | "stealth-rock";
+      turns?: number;
+      layers?: number;
+      maxLayers?: number;
+    }
+  | {
+      kind: "protect";
+      target: "user";
+      phase: "onUse";
+      protectType: "protect" | "detect" | "spiky-shield" | "kings-shield" | "baneful-bunker";
+      blocksDamage: boolean;
+      blocksStatus: boolean;
+      successDecay: boolean;
+    };
+
 export type BattleMove = {
   id: string;
   name: string;
@@ -63,6 +147,8 @@ export type BattleMove = {
   statChangeChance?: number;
   target?: string;
   isContact?: boolean;
+  execution?: BattleMoveExecution;
+  effects?: BattleMoveEffect[];
 };
 
 export type BattleStatusCondition = "none" | "burn" | "poison" | "bad-poison" | "paralyze" | "sleep" | "freeze";
@@ -93,6 +179,9 @@ export type BattleMonster = {
   sprite: BattleSpriteSet;
   moves: BattleMove[];
   slotIndex?: number;
+  expCurrent?: number;
+  expToNext?: number;
+  expTotal?: number;
   abilityId?: string | null;
   heldItemId?: string | null;
   status?: BattleStatusCondition;
@@ -110,6 +199,7 @@ export type BattleMonster = {
   protectMoveId?: string | null;
   protectStreak?: number;
   chargingMoveId?: string | null;
+  volatileStatuses?: { id: string; turns?: number; sourceMoveId?: string | null }[];
 };
 
 export type BattleTeam = BattleMonster[];
@@ -125,6 +215,7 @@ export type BattleTurnEventType =
   | "attack"
   | "hit"
   | "hp"
+  | "status"
   | "faint"
   | "switch"
   | "weather"
@@ -134,8 +225,13 @@ export type BattleTurnEvent = {
   type: BattleTurnEventType;
   side?: BattleSide;
   text?: string;
+  activeIndex?: number;
+  moveId?: string;
+  moveStage?: "charge" | "execute";
+  semiInvulnerablePhase?: "airborne" | "underground" | "underwater" | "vanished" | null;
   hpCurrent?: number;
   hpTotal?: number;
+  status?: BattleStatusCondition;
   targetHpCurrent?: number;
   targetHpTotal?: number;
   weather?: BattleWeather;

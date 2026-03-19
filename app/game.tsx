@@ -3,18 +3,21 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Image,
   Modal,
+  PanResponder,
   Pressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { Monitor } from "lucide-react-native";
+import { Monitor, Shield } from "lucide-react-native";
 import {
   doc,
   getDoc,
@@ -31,8 +34,44 @@ import {
 import { getAuth } from "firebase/auth";
 
 import { db } from "../src/services/firebase/firebaseConfig";
+import { biomeAllowsGym, getBiomeDocByKey } from "../src/services/firebase/biome.service";
 import { registerBiomeCapture } from "../src/services/firebase/biome-capture.service";
+import {
+  addPokemonToGymMainTeam,
+  addPokemonToGymStorage,
+  healGymPokemon,
+  listenGymMainTeam,
+  listenGymStorage,
+  listenPlayerGymByCharacter,
+  type GymRosterEntry,
+  type PlayerGymDoc,
+  removePokemonFromGymMainTeam,
+} from "../src/services/firebase/gym.service";
 import { COLORS } from "../src/theme/colors";
+import {
+  listenPlayerProductEntitlements,
+  type PlayerAccountBackpackEntry,
+  type PlayerProductEntitlement,
+  type TrainerLicenseState,
+  type VipBenefitSet,
+} from "../src/services/firebase/monetization.service";
+import {
+  getActiveVipBenefits,
+  isEntitlementActive,
+  parseMetadataNumber,
+  parseMetadataString,
+  parseMetadataStringList,
+  resolveGymTypeXpMultiplier,
+  resolveCaptureLimit,
+  resolveItemStorageLimit,
+  resolveMoneyMultiplier,
+  resolveTrainerBiomeAccessIds,
+  resolveTrainerShinyBonusPercent,
+  resolveXpMultiplier,
+} from "../src/services/monetization/runtime.service";
+import { getProductIdentity, isGymMainTeamSlotProduct, resolveProductRoute } from "../src/services/monetization/product-routing.service";
+
+const DEBUG_ECOIN_FLOW = true;
 
 // ✅ UI componentizada (Game)
 import { GameMenu } from "../src/components/game/Menu";
@@ -100,6 +139,10 @@ type CharacterDoc = {
 
 type PlayerDoc = {
   playerType?: "VIP" | "FREE";
+  vipExpiresAtMs?: number | null;
+  vipBenefits?: VipBenefitSet | null;
+  trainerLicense?: TrainerLicenseState | null;
+  vipWeeklyIncubatorLastGrantAtMs?: number | null;
 };
 
 type TeamPokemonDoc = {
@@ -151,6 +194,8 @@ type TeamPokemonDoc = {
 
 type BoxPokemonDoc = Omit<TeamPokemonDoc, "slotIndex"> & { slotIndex?: number };
 
+type EffectiveEncounter = WildEncounter & { biomeId?: string; moves?: string[]; isShiny?: boolean };
+
 type InventoryDoc = {
   id: string;
   kind: "ITEM" | "POKEBALL";
@@ -165,6 +210,8 @@ type InventoryDoc = {
   consumable?: boolean;
   captureBonus?: number;
   isMasterBall?: boolean;
+  imageUrl?: string | null;
+  metadata?: Record<string, unknown> | null;
   updatedAt?: any;
 };
 
@@ -175,12 +222,19 @@ type EggDoc = {
   stepsRequired: number;
   stepsProgress: number;
   inheritedEggMoves: string[];
-  status: "incubating" | "ready" | "hatched";
-  source?: "daycare" | "manual";
+  status: "stored" | "incubating" | "ready" | "hatched";
+  source?: "daycare" | "manual" | "shop";
   hatchMode?: "steps" | "time";
   readyAtMs?: number | null;
   requiresIncubator?: boolean;
   incubatorAssignedAt?: any;
+  startedAt?: any;
+  endsAt?: any;
+  startedAtMs?: number | null;
+  endsAtMs?: number | null;
+  incubatorId?: string | null;
+  storageLocation?: "team" | "box";
+  storageSlotIndex?: number | null;
   createdAt?: any;
   updatedAt?: any;
 };
@@ -206,10 +260,63 @@ const CAPTURE_CONFIG_VERSION_ID = "elodex-base";
 const MOVE_TUTOR_COST_COINS = 1200;
 const MOVE_TUTOR_ITEM_ID = "heart-scale";
 const EGG_INCUBATOR_ITEM_ID = "egg-incubator";
+const DEFAULT_SHOP_EGG_POOL = [172, 173, 174, 175, 236, 238, 239, 240, 280, 298, 360, 406, 438, 439, 440, 446, 447, 458];
+const DEFAULT_PSEUDO_EGG_POOL = [147, 246, 371, 443, 610, 704, 782, 885, 996];
 const DAYCARE_PROFILE_BY_TIER: Record<"FREE" | "VIP", { eggHatchDays: number; eggStepThreshold: number }> = {
   FREE: { eggHatchDays: 3, eggStepThreshold: 1024 },
   VIP: { eggHatchDays: 1, eggStepThreshold: 768 },
 };
+
+function resolveIncubatorHatchDays(raw: Record<string, unknown> | null | undefined, fallback = 3) {
+  const direct = Number(raw?.hatchDays ?? raw?.requiredDays ?? raw?.distanceKm ?? fallback);
+  return Math.max(1, Math.floor(Number.isFinite(direct) ? direct : fallback));
+}
+
+function buildIncubatorItemId(hatchDays: number) {
+  return `egg-incubator-${Math.max(1, Math.floor(hatchDays))}d`;
+}
+
+function buildIncubatorItemDoc(hatchDays: number, quantity: number) {
+  const safeDays = Math.max(1, Math.floor(hatchDays));
+  return {
+    id: buildIncubatorItemId(safeDays),
+    kind: "ITEM",
+    name: `Incubadora ${safeDays}d`,
+    description: `Use na aba de ovos para incubar manualmente um ovo por ${safeDays} dia(s).`,
+    quantity,
+    effectType: null,
+    metadata: {
+      incubatorDays: safeDays,
+      incubatorUses: 1,
+    },
+    updatedAt: serverTimestamp(),
+  };
+}
+
+function getEggSpeciesRows() {
+  return (Array.isArray(pokemonSpecies) ? pokemonSpecies : Object.values(pokemonSpecies as Record<string, unknown>)) as Array<Record<string, any>>;
+}
+
+function pickShopEggSpecies(options?: { pokemonType?: string | null; pseudoChancePercent?: number | null }) {
+  const normalizedType = String(options?.pokemonType || "").trim().toLowerCase();
+  const pseudoChance = Math.max(0, Math.min(100, Number(options?.pseudoChancePercent || 5)));
+  const rows = getEggSpeciesRows();
+  const eligible = rows.filter((row) => {
+    const speciesId = Math.trunc(Number(row?.id ?? row?.speciesId ?? 0));
+    if (speciesId <= 0) return false;
+    const flags = (row?.flags || {}) as Record<string, unknown>;
+    if (Boolean(flags.legendary) || Boolean(flags.mythical) || Boolean(flags.ultraBeast)) return false;
+    const types = Array.isArray(row?.types) ? row.types.map((value: unknown) => String(value).trim().toLowerCase()) : [];
+    if (normalizedType && !types.includes(normalizedType)) return false;
+    return true;
+  });
+  const pseudoPool = eligible.filter((row) => DEFAULT_PSEUDO_EGG_POOL.includes(Math.trunc(Number(row?.id ?? row?.speciesId ?? 0))));
+  const standardPool = eligible.filter((row) => !DEFAULT_PSEUDO_EGG_POOL.includes(Math.trunc(Number(row?.id ?? row?.speciesId ?? 0))) && DEFAULT_SHOP_EGG_POOL.includes(Math.trunc(Number(row?.id ?? row?.speciesId ?? 0))));
+  const fallbackPool = standardPool.length ? standardPool : eligible;
+  const sourcePool = pseudoPool.length > 0 && Math.random() * 100 < pseudoChance ? pseudoPool : fallbackPool;
+  const selected = sourcePool[Math.floor(Math.random() * Math.max(1, sourcePool.length))];
+  return Math.max(1, Math.trunc(Number(selected?.id ?? selected?.speciesId ?? 172)));
+}
 
 const DEFAULT_ITEMS: InventoryDoc[] = [
   {
@@ -650,6 +757,11 @@ function getSpeciesAbilities(speciesId: number): string[] {
   return [];
 }
 
+function getSpeciesTypesLocal(speciesId: number): string[] {
+  const e = getSpeciesEntry(speciesId);
+  return Array.isArray(e?.types) ? e.types.map((value: unknown) => String(value).trim().toLowerCase()).filter(Boolean) : [];
+}
+
 function getMoveType(moveId: string): string | null {
   const key = String(moveId || "").trim().toLowerCase();
   if (!key) return null;
@@ -812,6 +924,8 @@ function toInventoryEntry(doc: InventoryDoc): InventoryEntry {
     consumable: doc.consumable,
     captureBonus: doc.captureBonus,
     isMasterBall: doc.isMasterBall,
+    imageUrl: doc.imageUrl ?? null,
+    metadata: doc.metadata ?? null,
   };
 }
 
@@ -891,7 +1005,8 @@ function computeCaptureChance(args: {
 
 export default function GameScreen() {
   const router = useRouter();
-  const { characterId } = useLocalSearchParams<{ characterId?: string }>();
+  const { characterId, openGymBox, openStore } = useLocalSearchParams<{ characterId?: string; openGymBox?: string; openStore?: string }>();
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
 
   const uid = getAuth().currentUser?.uid || "";
 
@@ -901,6 +1016,20 @@ export default function GameScreen() {
 
   // ✅ VIP/FREE via players/{uid}.playerType
   const [playerType, setPlayerType] = useState<"VIP" | "FREE">("FREE");
+  const [vipBenefits, setVipBenefits] = useState<VipBenefitSet | null>(null);
+  const [vipExpiresAtMs, setVipExpiresAtMs] = useState<number>(0);
+  const [trainerLicense, setTrainerLicense] = useState<TrainerLicenseState | null>(null);
+  const [productEntitlements, setProductEntitlements] = useState<PlayerProductEntitlement[]>([]);
+  const [playerGym, setPlayerGym] = useState<PlayerGymDoc | null>(null);
+  const [gymMode, setGymMode] = useState(false);
+  const [gymMainTeam, setGymMainTeam] = useState<TeamPokemonUI[]>([]);
+  const [gymStorage, setGymStorage] = useState<TeamPokemonUI[]>([]);
+  const [nurseModalVisible, setNurseModalVisible] = useState(false);
+  const [nurseMode, setNurseMode] = useState<"menu" | "heal">("menu");
+  const [nurseSelectedSlots, setNurseSelectedSlots] = useState<number[]>([]);
+  const [currentBiomeGymEnabled, setCurrentBiomeGymEnabled] = useState(false);
+  const [currentBiomeGymId, setCurrentBiomeGymId] = useState("");
+  const [activeExploreBiomeId, setActiveExploreBiomeId] = useState("");
 
   // ✅ Mochila na tela principal (não modal)
   const [bagTab, setBagTab] = useState<BagTabKey>("TEAM");
@@ -917,7 +1046,7 @@ export default function GameScreen() {
   const [daycare, setDaycare] = useState<DaycareStateDoc | null>(null);
   const [daycareUnlocked, setDaycareUnlocked] = useState(true);
   const [daycareUnlockHint, setDaycareUnlockHint] = useState<string | null>(null);
-  const [wildEncounter, setWildEncounter] = useState<WildEncounter | null>(null);
+  const [wildEncounter, setWildEncounter] = useState<EffectiveEncounter | null>(null);
   const [biomeNpcAccess, setBiomeNpcAccess] = useState<{
     canBreeding: boolean;
     canRelearn: boolean;
@@ -937,6 +1066,11 @@ export default function GameScreen() {
 
   // ✅ Ação atual do menu inferior
   const [activeAction, setActiveAction] = useState<GameActionKey>("BAG");
+  const gymFabSize = 54;
+  const gymFabMargin = 16;
+  const gymFabPosition = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  const gymFabLastPosition = useRef({ x: 0, y: 0 });
+  const gymFabInitialized = useRef(false);
 
   function normalizeActionKey(key: string): GameActionKey {
     const raw = String(key || "").toUpperCase();
@@ -951,9 +1085,84 @@ export default function GameScreen() {
     return "BAG";
   }
 
+  function clampGymFabPosition(x: number, y: number) {
+    const maxX = Math.max(gymFabMargin, screenWidth - gymFabSize - gymFabMargin);
+    const maxY = Math.max(120, screenHeight - gymFabSize - 110);
+    return {
+      x: Math.max(gymFabMargin, Math.min(maxX, x)),
+      y: Math.max(120, Math.min(maxY, y)),
+    };
+  }
+
+  const gymFabPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => false,
+        onMoveShouldSetPanResponder: (_, gestureState) =>
+          Math.abs(gestureState.dx) > 4 || Math.abs(gestureState.dy) > 4,
+        onPanResponderGrant: () => {
+          gymFabPosition.stopAnimation((value: any) => {
+            gymFabLastPosition.current = {
+              x: Number(value?.x || 0),
+              y: Number(value?.y || 0),
+            };
+          });
+        },
+        onPanResponderMove: (_, gestureState) => {
+          const next = clampGymFabPosition(
+            gymFabLastPosition.current.x + gestureState.dx,
+            gymFabLastPosition.current.y + gestureState.dy
+          );
+          gymFabPosition.setValue(next);
+        },
+        onPanResponderRelease: () => {
+          gymFabPosition.stopAnimation((value: any) => {
+            const next = clampGymFabPosition(Number(value?.x || 0), Number(value?.y || 0));
+            gymFabLastPosition.current = next;
+            Animated.spring(gymFabPosition, {
+              toValue: next,
+              useNativeDriver: false,
+              bounciness: 6,
+            }).start();
+          });
+        },
+      }),
+    [gymFabPosition, screenHeight, screenWidth]
+  );
+
   const handleMenuPress = (key: GameActionKey) => {
     setActiveAction(normalizeActionKey(key));
   };
+  const currentBiomeId = useMemo(() => {
+    if (activeExploreBiomeId) return String(activeExploreBiomeId).trim().toLowerCase();
+    return String(character?.region || "")
+      .trim()
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }, [activeExploreBiomeId, character?.region]);
+  useEffect(() => {
+    let cancelled = false;
+    async function resolveCurrentBiomeGymState() {
+      if (!currentBiomeId) {
+        if (!cancelled) {
+          setCurrentBiomeGymEnabled(false);
+          setCurrentBiomeGymId("");
+        }
+        return;
+      }
+      const biomeRow = await getBiomeDocByKey(currentBiomeId);
+      if (cancelled) return;
+      setCurrentBiomeGymEnabled(biomeAllowsGym(biomeRow?.data || null));
+      setCurrentBiomeGymId(String(biomeRow?.id || currentBiomeId).trim().toLowerCase());
+    }
+    void resolveCurrentBiomeGymState();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentBiomeId]);
   const safeCharacterId = useMemo(() => {
     if (!characterId) return "";
     return Array.isArray(characterId) ? characterId[0] : characterId;
@@ -982,13 +1191,77 @@ export default function GameScreen() {
     return `${pct}%`;
   }, [character]);
 
-  const itemCapacityLimit = useMemo(() => BAG_LIMIT_BY_PLAYER[playerType], [playerType]);
+  const activeVipBenefits = useMemo(
+    () => getActiveVipBenefits(vipBenefits, vipExpiresAtMs),
+    [vipBenefits, vipExpiresAtMs]
+  );
+  const activeEntitlements = useMemo(
+    () => productEntitlements.filter((entry) => isEntitlementActive(entry)),
+    [productEntitlements]
+  );
+  const itemCapacityLimit = useMemo(
+    () => resolveItemStorageLimit(activeVipBenefits, activeEntitlements),
+    [activeEntitlements, activeVipBenefits]
+  );
   const pokeballCapacityLimit = useMemo(() => BAG_LIMIT_BY_PLAYER[playerType], [playerType]);
+  const captureCapacityLimit = useMemo(() => resolveCaptureLimit(activeVipBenefits), [activeVipBenefits]);
+  const xpMultiplier = useMemo(
+    () => resolveXpMultiplier(activeVipBenefits, trainerLicense),
+    [activeVipBenefits, trainerLicense]
+  );
+  const moneyMultiplier = useMemo(() => resolveMoneyMultiplier(activeVipBenefits), [activeVipBenefits]);
+  const trainerBiomeAccessIds = useMemo(
+    () => resolveTrainerBiomeAccessIds(trainerLicense),
+    [trainerLicense]
+  );
+  const trainerShinyBonusPercent = useMemo(
+    () => resolveTrainerShinyBonusPercent(trainerLicense),
+    [trainerLicense]
+  );
+  const gymSlotLimit = useMemo(
+    () => Math.max(1, Math.min(6, Number(playerGym?.mainTeamSlotLimit || 1))),
+    [playerGym?.mainTeamSlotLimit]
+  );
+  const activeGymTeam = useMemo(
+    () => gymMainTeam.slice(0, gymSlotLimit),
+    [gymMainTeam, gymSlotLimit]
+  );
+  const displayedBagTeam = useMemo(
+    () => (gymMode ? activeGymTeam : team),
+    [gymMode, activeGymTeam, team]
+  );
+  const canSendSelectedTeamToGym = useMemo(() => {
+    if (!playerGym?.active || gymMode) return false;
+    return team.some((mon) => {
+      if (Number(mon.speciesId || 0) <= 0) return false;
+      return getSpeciesTypesLocal(Number(mon.speciesId || 0)).includes(String(playerGym.gymType || "").trim().toLowerCase());
+    });
+  }, [playerGym?.active, playerGym?.gymType, gymMode, team]);
   const itemCapacityUsed = useMemo(() => sumInventoryQuantity(bagItems), [bagItems]);
   const pokeballCapacityUsed = useMemo(() => sumInventoryQuantity(bagPokeballs), [bagPokeballs]);
-  const incubatorCount = useMemo(
-    () => Math.max(0, Number(bagItems.find((x) => x.id === EGG_INCUBATOR_ITEM_ID)?.quantity || 0)),
+  const eggIncubators = useMemo(
+    () =>
+      bagItems
+        .filter((item) => item.id === EGG_INCUBATOR_ITEM_ID || item.id.startsWith(`${EGG_INCUBATOR_ITEM_ID}-`))
+        .filter((item) => item.quantity > 0)
+        .map((item) => ({
+          id: item.id,
+          name: item.name,
+          quantity: Math.max(0, Number(item.quantity || 0)),
+          hatchDays: resolveIncubatorHatchDays((item.metadata || null) as Record<string, unknown> | null),
+        }))
+        .sort((a, b) => a.hatchDays - b.hatchDays),
     [bagItems]
+  );
+  const incubatorCount = useMemo(
+    () => eggIncubators.reduce((sum, incubator) => sum + incubator.quantity, 0),
+    [eggIncubators]
+  );
+  const capturedPokemonCount = useMemo(
+    () =>
+      team.filter((entry) => Number(entry.speciesId) > 0).length +
+      box.filter((entry) => Number(entry.speciesId) > 0).length,
+    [box, team]
   );
   const partySpeciesIds = useMemo(
     () => team.map((m) => Math.max(0, Number(m.speciesId || 0))).filter((id) => id > 0),
@@ -1047,7 +1320,11 @@ export default function GameScreen() {
 
     if (snap.exists()) {
       const data = snap.data() as PlayerDoc;
-      if (data?.playerType === "VIP") {
+      const vipExpired = Number(data?.vipExpiresAtMs || 0) > 0 && Number(data?.vipExpiresAtMs || 0) < Date.now();
+      setVipBenefits(vipExpired ? null : data?.vipBenefits || null);
+      setVipExpiresAtMs(Math.max(0, Number(data?.vipExpiresAtMs || 0)));
+      setTrainerLicense(data?.trainerLicense || null);
+      if (data?.playerType === "VIP" && !vipExpired) {
         setPlayerType("VIP");
         return "VIP";
       }
@@ -1055,6 +1332,9 @@ export default function GameScreen() {
       return "FREE";
     } else {
       setPlayerType("FREE");
+      setVipBenefits(null);
+      setVipExpiresAtMs(0);
+      setTrainerLicense(null);
       return "FREE";
     }
   }
@@ -1087,36 +1367,62 @@ export default function GameScreen() {
     const timeCol = collection(db, "players", uid, "characters", safeCharacterId, "time");
     const snap = await getDocs(timeCol);
 
-    const docs: TeamPokemonDoc[] = [];
+    const docs: Array<{ id: string; data: TeamPokemonDoc }> = [];
     snap.forEach((d) => {
       if (d.id === "_meta") return;
-      docs.push(d.data() as TeamPokemonDoc);
+      docs.push({ id: d.id, data: d.data() as TeamPokemonDoc });
     });
 
     // ✅ Se não tiver Pokémon real, cria starter (contas antigas)
     if (docs.length === 0) {
       const starterRef = doc(db, "players", uid, "characters", safeCharacterId, "time", "slot_1");
+      const starterSpeciesId = Number(char.starterPokemon.speciesId);
+      const starterNature = char.starterPokemon.nature || "Docile";
+      const starterIvs = { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 };
+      const starterEvs = { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 };
+      const starterBase = resolveBaseStats(starterSpeciesId);
+      const starterReal = starterBase
+        ? calcRealStats({
+            level: 5,
+            nature: starterNature,
+            base: starterBase,
+            ivs: starterIvs,
+            evs: starterEvs,
+          })
+        : null;
       const starterMoves = ensureMinMoveSet(
-        Number(char.starterPokemon.speciesId),
+        starterSpeciesId,
         5,
-        resolveMovesForSpeciesAtLevel(Number(char.starterPokemon.speciesId), 5),
+        resolveMovesForSpeciesAtLevel(starterSpeciesId, 5),
         2
       );
 
       await setDoc(starterRef, {
         slotIndex: 1,
-        speciesId: Number(char.starterPokemon.speciesId),
+        speciesId: starterSpeciesId,
         speciesName: char.starterPokemon.speciesName,
         nickname: char.starterPokemon.nickname ?? char.starterPokemon.speciesName,
         level: 5,
-        nature: char.starterPokemon.nature || "Docile",
+        nature: starterNature,
         gender: (char.starterPokemon.gender as any) || "U",
         abilityId: char.starterPokemon.abilityId || "",
 
-        exp: { current: 0, toNext: 20 },
-        hp: { current: 18, total: 22 },
-        ivs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
-        evs: { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 },
+        exp: { current: 0, toNext: expToNextForLevel(5) },
+        hp: {
+          current: Math.max(1, Number(starterReal?.hp ?? 1)),
+          total: Math.max(1, Number(starterReal?.hp ?? 1)),
+        },
+        stats: starterReal
+          ? {
+              atk: starterReal.atk,
+              def: starterReal.def,
+              spa: starterReal.spa,
+              spd: starterReal.spd,
+              spe: starterReal.spe,
+            }
+          : undefined,
+        ivs: starterIvs,
+        evs: starterEvs,
         moves: starterMoves,
         moveHistory: starterMoves,
         relearnableMoves: [],
@@ -1137,13 +1443,99 @@ export default function GameScreen() {
       return loadTeamFromFirestore(char);
     }
 
+    const normalizedDocs = docs.map(({ id, data }) => {
+      const speciesId = Math.max(1, Number(data.speciesId || 1));
+      const level = Math.max(1, Number(data.level || 1));
+      const nature = data.nature || "Docile";
+      const ivs = data.ivs ?? { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 };
+      const evs = data.evs ?? { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 };
+      const base = resolveBaseStats(speciesId);
+      const real = base
+        ? calcRealStats({
+            level,
+            nature,
+            base,
+            ivs,
+            evs,
+          })
+        : null;
+      const normalizedMoves = ensureMinMoveSet(
+        speciesId,
+        level,
+        Array.isArray(data.moves) ? data.moves : [],
+        2
+      );
+      const normalizedMoveHistory =
+        Array.isArray(data.moveHistory) && data.moveHistory.length > 0
+          ? Array.from(new Set([...data.moveHistory, ...normalizedMoves]))
+          : normalizedMoves;
+      const hpTotal = Math.max(1, Number(real?.hp ?? data.hp?.total ?? 1));
+      const hpCurrentRaw = Number(data.hp?.current ?? hpTotal);
+      const hpCurrent = hpCurrentRaw <= 0 ? 0 : Math.max(1, Math.min(hpTotal, hpCurrentRaw));
+      const normalizedData: TeamPokemonDoc = {
+        ...data,
+        level,
+        nature,
+        ivs,
+        evs,
+        exp: {
+          current: Math.max(0, Number(data.exp?.current ?? 0)),
+          toNext: Math.max(1, Number(data.exp?.toNext ?? expToNextForLevel(level))),
+        },
+        hp: {
+          current: hpCurrent,
+          total: hpTotal,
+        },
+        stats: real
+          ? {
+              atk: real.atk,
+              def: real.def,
+              spa: real.spa,
+              spd: real.spd,
+              spe: real.spe,
+            }
+          : data.stats,
+        moves: normalizedMoves,
+        moveHistory: normalizedMoveHistory,
+        relearnableMoves: Array.isArray(data.relearnableMoves) ? data.relearnableMoves : [],
+        learnsetConstraints:
+          data.learnsetConstraints ??
+          normalizeLearnsetConstraints(versionMap[speciesId]) ??
+          null,
+      };
+      const needsNormalization =
+        !data.stats ||
+        !Array.isArray(data.moves) ||
+        data.moves.length === 0 ||
+        !data.hp ||
+        Number(data.hp?.total ?? 0) !== hpTotal ||
+        Number(data.hp?.current ?? -1) !== hpCurrent;
+      return { id, data: normalizedData, needsNormalization };
+    });
+
+    const docsToNormalize = normalizedDocs.filter((entry) => entry.needsNormalization);
+    if (docsToNormalize.length) {
+      const batch = writeBatch(db);
+      docsToNormalize.forEach(({ id, data }) => {
+        batch.set(
+          doc(db, "players", uid, "characters", safeCharacterId, "time", id),
+          {
+            ...data,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      });
+      await batch.commit();
+    }
+
     const bySlot = new Map<number, TeamPokemonDoc>();
-    docs.forEach((p) => bySlot.set(Number(p.slotIndex), p));
+    normalizedDocs.forEach(({ data }) => bySlot.set(Number(data.slotIndex), data));
 
     // guarda docs para modal
     const docMap: Record<string, TeamPokemonDoc> = {};
-    docs.forEach((p) => {
-      docMap[String(p.slotIndex)] = p;
+    normalizedDocs.forEach(({ data }) => {
+      docMap[String(data.slotIndex)] = data;
     });
     setTeamDocsBySlot(docMap);
 
@@ -1435,6 +1827,15 @@ export default function GameScreen() {
   async function loadBagFromFirestore(tierOverride?: "FREE" | "VIP") {
     if (!uid || !safeCharacterId) return;
 
+    if (DEBUG_ECOIN_FLOW) {
+      console.log("[ECOIN_FLOW][bag:load:start]", {
+        uid,
+        safeCharacterId,
+        itemsPath: `players/${uid}/characters/${safeCharacterId}/itens`,
+        pokeballsPath: `players/${uid}/characters/${safeCharacterId}/pokeballs`,
+      });
+    }
+
     await seedInventoryIfEmpty("itens", DEFAULT_ITEMS);
     await seedInventoryIfEmpty("pokeballs", DEFAULT_POKEBALLS);
 
@@ -1474,6 +1875,15 @@ export default function GameScreen() {
     setBagItems(nextItems.sort((a, b) => a.name.localeCompare(b.name)));
     setBagPokeballs(nextBalls.sort((a, b) => a.name.localeCompare(b.name)));
 
+    if (DEBUG_ECOIN_FLOW) {
+      console.log("[ECOIN_FLOW][bag:load:done]", {
+        uid,
+        safeCharacterId,
+        itemIds: nextItems.map((item) => item.id),
+        hasGymMainTeamSlotToken: nextItems.some((item) => item.id === "gym-main-team-slot-token"),
+      });
+    }
+
     const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
     const ballMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "pokeballs", "_meta");
 
@@ -1483,7 +1893,7 @@ export default function GameScreen() {
       setDoc(
         itemMetaRef,
         {
-          limit: BAG_LIMIT_BY_PLAYER[tier],
+          limit: itemCapacityLimit,
           totalQuantity: sumInventoryQuantity(nextItems),
           updatedAt: serverTimestamp(),
         },
@@ -1517,14 +1927,19 @@ export default function GameScreen() {
         ? Math.max(1, Math.trunc(stepsRequiredRaw))
         : getSpeciesHatchSteps(speciesId);
       const hatchMode = data.hatchMode === "time" ? "time" : "steps";
-      const readyAtMsRaw = Number(data.readyAtMs || 0);
-      const readyAtMs = Number.isFinite(readyAtMsRaw) && readyAtMsRaw > 0 ? readyAtMsRaw : null;
+      const endsAtMsRaw = Number(data.endsAtMs ?? data.readyAtMs ?? 0);
+      const endsAtMs = Number.isFinite(endsAtMsRaw) && endsAtMsRaw > 0 ? endsAtMsRaw : null;
+      const startedAtMsRaw = Number(data.startedAtMs || 0);
+      const startedAtMs = Number.isFinite(startedAtMsRaw) && startedAtMsRaw > 0 ? startedAtMsRaw : null;
       const progress = Math.max(0, Number(data.stepsProgress || 0));
       const readyBySteps = progress >= stepsRequired;
-      const readyByTime = hatchMode === "time" && readyAtMs != null && nowMs >= readyAtMs;
+      const readyByTime = hatchMode === "time" && endsAtMs != null && nowMs >= endsAtMs;
+      const baseStatus = data.status === "stored" ? "stored" : data.status;
       const computedStatus =
         data.status === "hatched"
           ? "hatched"
+          : baseStatus === "stored"
+            ? "stored"
           : readyBySteps || readyByTime
             ? "ready"
             : "incubating";
@@ -1540,11 +1955,18 @@ export default function GameScreen() {
         stepsProgress: progress,
         inheritedEggMoves: Array.isArray(data.inheritedEggMoves) ? data.inheritedEggMoves : [],
         status: computedStatus,
-        source: data.source === "daycare" ? "daycare" : "manual",
+        source: data.source === "daycare" ? "daycare" : data.source === "shop" ? "shop" : "manual",
         hatchMode,
-        readyAtMs,
+        readyAtMs: endsAtMs,
+        startedAtMs,
+        endsAtMs,
         requiresIncubator: !!data.requiresIncubator,
         incubatorAssignedAt: data.incubatorAssignedAt,
+        startedAt: data.startedAt,
+        endsAt: data.endsAt,
+        incubatorId: typeof data.incubatorId === "string" ? data.incubatorId : null,
+        storageLocation: data.storageLocation === "team" ? "team" : "box",
+        storageSlotIndex: Number.isFinite(Number((data as any).storageSlotIndex)) ? Math.max(1, Math.min(6, Number((data as any).storageSlotIndex))) : null,
         createdAt: data.createdAt,
         updatedAt: data.updatedAt,
       });
@@ -1558,6 +1980,524 @@ export default function GameScreen() {
     }
     next.sort((a, b) => String(a.status).localeCompare(String(b.status)));
     setEggs(next);
+  }
+
+  function buildInventoryDoc(args: {
+    id: string;
+    name: string;
+    description: string;
+    quantity: number;
+    effectType?: ItemEffectType;
+    consumable?: boolean;
+    kind?: "ITEM" | "POKEBALL";
+    imageUrl?: string | null;
+    metadata?: Record<string, unknown> | null;
+  }): InventoryDoc {
+    return {
+      id: args.id,
+      kind: args.kind ?? "ITEM",
+      name: args.name,
+      description: args.description,
+      quantity: Math.max(1, Math.trunc(Number(args.quantity || 1))),
+      effectType: args.effectType,
+      consumable: args.consumable,
+      imageUrl: args.imageUrl ?? null,
+      metadata: args.metadata ?? null,
+    };
+  }
+
+  function isLegacyGymMainTeamSlotReward(entry: Partial<PlayerAccountBackpackEntry> | null | undefined) {
+    const productType = String(entry?.productType || "").trim().toLowerCase();
+    const productCode = String(entry?.productCode || "").trim().toLowerCase();
+    const productId = String(entry?.productId || "").trim().toLowerCase();
+    const productName = String(entry?.name || "").trim().toLowerCase();
+    const metadata = (entry?.benefits?.metadata || {}) as Record<string, unknown>;
+    const slotScope = String(metadata.slotScope || "").trim().toLowerCase();
+    const storeCategory = String(metadata.storeCategory || "").trim().toLowerCase();
+    const gymMainTeamSlots = Number(entry?.benefits?.gymMainTeamSlots || 0);
+    const gymDefenseSlotsAdded = Number(entry?.benefits?.gymDefenseSlotsAdded || 0);
+
+    return (
+      productType === "gym_main_team_slot" ||
+      (productType === "slot" && slotScope === "gym") ||
+      productCode === "gym-main-team-slot" ||
+      productId === "gym-main-team-slot" ||
+      productCode === "slot-de-defesa" ||
+      productId === "slot-de-defesa" ||
+      ((gymMainTeamSlots > 0 || gymDefenseSlotsAdded > 0) &&
+        (storeCategory === "gym" ||
+          productType.includes("gym") ||
+          productCode.includes("gym-main-team-slot") ||
+          productId.includes("gym-main-team-slot") ||
+          productCode.includes("slot-de-defesa") ||
+          productId.includes("slot-de-defesa") ||
+          productName.includes("slot de defesa") ||
+          productName.includes("slot do time principal")))
+    );
+  }
+
+  async function syncLegacyGymSlotRewardsFromAccountBackpack() {
+    if (!uid || !safeCharacterId) return;
+
+    const backpackRef = collection(db, "players", uid, "accountBackpack");
+    const backpackSnap = await getDocs(backpackRef);
+    const pendingRows = backpackSnap.docs
+      .map((entryDoc) => ({ id: entryDoc.id, ...(entryDoc.data() as Omit<PlayerAccountBackpackEntry, "id">) }))
+      .filter((entry) => entry.status === "pending" && isLegacyGymMainTeamSlotReward(entry));
+
+    if (!pendingRows.length) return;
+
+    await runTransaction(db, async (tx) => {
+      const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "gym-main-team-slot-token");
+      const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
+      const [itemSnap, metaSnap] = await Promise.all([tx.get(itemRef), tx.get(itemMetaRef)]);
+
+      let migratedQuantity = 0;
+
+      for (const entry of pendingRows) {
+        const rewardRef = doc(db, "players", uid, "accountBackpack", entry.id);
+        const rewardSnap = await tx.get(rewardRef);
+        if (!rewardSnap.exists()) continue;
+
+        const freshReward = {
+          id: rewardSnap.id,
+          ...(rewardSnap.data() as Omit<PlayerAccountBackpackEntry, "id">),
+        };
+        if (freshReward.status !== "pending" || !isLegacyGymMainTeamSlotReward(freshReward)) continue;
+
+        const add = Math.max(
+          1,
+          Math.trunc(
+            Number(
+              freshReward.quantity ||
+                freshReward.benefits?.gymDefenseSlotsAdded ||
+                freshReward.benefits?.gymMainTeamSlots ||
+                parseMetadataNumber(freshReward.benefits?.metadata || {}, "slotsAdded", 1)
+            )
+          )
+        );
+
+        migratedQuantity += add;
+
+        tx.set(doc(collection(db, "players", uid, "accountDistributionHistory")), {
+          accountBackpackEntryId: freshReward.id,
+          rewardType: freshReward.rewardType,
+          rewardName: freshReward.name,
+          quantity: add,
+          characterId: safeCharacterId,
+          source: "legacy_account_backpack_migration",
+          sourceOrderId: freshReward.sourceOrderId || null,
+          sourcePlanId: freshReward.sourcePlanId || null,
+          sourceProductId: freshReward.sourceProductId || freshReward.productId || null,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        tx.delete(rewardRef);
+      }
+
+      if (migratedQuantity <= 0) return;
+
+      const currentQty = Math.max(0, Number(itemSnap.data()?.quantity || 0));
+      const totalQuantity = Math.max(0, Number(metaSnap.data()?.totalQuantity || 0));
+
+      tx.set(
+        itemRef,
+        {
+          ...buildInventoryDoc({
+            id: "gym-main-team-slot-token",
+            name: "Slot do time principal do GYM",
+            description: "Use na mochila do personagem para liberar um novo slot do time principal do GYM.",
+            quantity: currentQty + migratedQuantity,
+            effectType: "ACTIVATE_GYM_MAIN_TEAM_SLOT",
+            metadata: {
+              source: "legacy_account_backpack_migration",
+              deliveredCharacterId: safeCharacterId,
+            },
+          }),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      tx.set(
+        itemMetaRef,
+        {
+          totalQuantity: totalQuantity + migratedQuantity,
+          limit: itemCapacityLimit,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    });
+  }
+
+  async function syncWeeklyVipIncubator() {
+    if (!uid || !safeCharacterId || !activeVipBenefits) return;
+    const weeklyAmount = Math.max(0, Math.trunc(Number(activeVipBenefits.weeklyIncubators || 0)));
+    if (weeklyAmount <= 0) return;
+
+    const playerRef = doc(db, "players", uid);
+    const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", EGG_INCUBATOR_ITEM_ID);
+    const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
+
+    await runTransaction(db, async (tx) => {
+      const [playerSnap, itemSnap, metaSnap] = await Promise.all([
+        tx.get(playerRef),
+        tx.get(itemRef),
+        tx.get(itemMetaRef),
+      ]);
+      const lastGrantAtMs = Math.max(0, Number(playerSnap.data()?.vipWeeklyIncubatorLastGrantAtMs || 0));
+      if (lastGrantAtMs > 0 && Date.now() - lastGrantAtMs < 7 * 24 * 60 * 60 * 1000) return;
+
+      const currentQty = Math.max(0, Number(itemSnap.data()?.quantity || 0));
+      const totalQuantity = Math.max(0, Number(metaSnap.data()?.totalQuantity || 0));
+      tx.set(
+        itemRef,
+        {
+          ...buildInventoryDoc({
+            id: EGG_INCUBATOR_ITEM_ID,
+            name: "Incubadora",
+            description: "Usada para chocar ovos que exigem incubadora.",
+            quantity: currentQty + weeklyAmount,
+          }),
+          updatedAt: serverTimestamp(),
+          createdAt: itemSnap.exists() ? itemSnap.data()?.createdAt || serverTimestamp() : serverTimestamp(),
+        },
+        { merge: true }
+      );
+      tx.set(
+        itemMetaRef,
+        {
+          totalQuantity: totalQuantity + weeklyAmount,
+          limit: itemCapacityLimit,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      tx.set(
+        playerRef,
+        {
+          vipWeeklyIncubatorLastGrantAtMs: Date.now(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    });
+  }
+
+  async function syncMonetizationEntitlements() {
+    if (!uid || !safeCharacterId || productEntitlements.length === 0) return;
+
+    if (DEBUG_ECOIN_FLOW) {
+      console.log("[ECOIN_FLOW][sync:start]", {
+        uid,
+        safeCharacterId,
+        entitlementCount: productEntitlements.length,
+      });
+    }
+
+    for (const entry of productEntitlements) {
+      if (!isEntitlementActive(entry)) continue;
+      if (entry.claimedAt) continue;
+      const route = resolveProductRoute(entry);
+      const productInfo = getProductIdentity(entry);
+      const deliveryScope = String(entry.deliveryScope || "").trim().toLowerCase();
+      const consumedByCharacterId = String(entry.consumedByCharacterId || "").trim();
+      if (DEBUG_ECOIN_FLOW) {
+        console.log("[ECOIN_FLOW][sync:inspect]", {
+          entitlementId: entry.id,
+          productId: entry.productId,
+          productCode: entry.productCode || null,
+          productType: entry.productType,
+          deliveryScope,
+          consumedByCharacterId,
+          claimedAt: entry.claimedAt ? "present" : null,
+        });
+      }
+      if (consumedByCharacterId && consumedByCharacterId !== safeCharacterId) {
+        if (DEBUG_ECOIN_FLOW) {
+          console.log("[ECOIN_FLOW][sync:skip]", {
+            entitlementId: entry.id,
+            reason: "consumedByCharacterId_mismatch",
+            safeCharacterId,
+            consumedByCharacterId,
+          });
+        }
+        continue;
+      }
+      if (deliveryScope === "character_backpack" && consumedByCharacterId && consumedByCharacterId !== safeCharacterId) {
+        if (DEBUG_ECOIN_FLOW) {
+          console.log("[ECOIN_FLOW][sync:skip]", {
+            entitlementId: entry.id,
+            reason: "deliveryScope_character_backpack_mismatch",
+            safeCharacterId,
+            consumedByCharacterId,
+          });
+        }
+        continue;
+      }
+
+      if (route.kind === "character_bag" && route.itemId === EGG_INCUBATOR_ITEM_ID) {
+        await runTransaction(db, async (tx) => {
+          const entitlementRef = doc(db, "players", uid, "productEntitlements", entry.id);
+          const hatchDays = resolveIncubatorHatchDays((entry.benefits?.metadata || null) as Record<string, unknown> | null);
+          const incubatorItemId = buildIncubatorItemId(hatchDays);
+          const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", incubatorItemId);
+          const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
+          const [freshEntitlementSnap, itemSnap, metaSnap] = await Promise.all([
+            tx.get(entitlementRef),
+            tx.get(itemRef),
+            tx.get(itemMetaRef),
+          ]);
+          if (!freshEntitlementSnap.exists() || freshEntitlementSnap.data()?.claimedAt) return;
+          const amount = Math.max(1, Math.trunc(Number(freshEntitlementSnap.data()?.benefits?.incubators || 1)));
+          const currentQty = Math.max(0, Number(itemSnap.data()?.quantity || 0));
+          const totalQuantity = Math.max(0, Number(metaSnap.data()?.totalQuantity || 0));
+          tx.set(
+            itemRef,
+            buildIncubatorItemDoc(hatchDays, currentQty + amount),
+            { merge: true }
+          );
+          tx.set(
+            itemMetaRef,
+            {
+              totalQuantity: totalQuantity + amount,
+              limit: itemCapacityLimit,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            entitlementRef,
+            { claimedAt: serverTimestamp(), claimedByCharacterId: safeCharacterId, updatedAt: serverTimestamp() },
+            { merge: true }
+          );
+        });
+        continue;
+      }
+
+      if (route.kind === "character_bag" && route.itemId === "iv-reset-token") {
+        await runTransaction(db, async (tx) => {
+          const entitlementRef = doc(db, "players", uid, "productEntitlements", entry.id);
+          const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "iv-reset-token");
+          const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
+          const [freshEntitlementSnap, itemSnap, metaSnap] = await Promise.all([
+            tx.get(entitlementRef),
+            tx.get(itemRef),
+            tx.get(itemMetaRef),
+          ]);
+          if (!freshEntitlementSnap.exists() || freshEntitlementSnap.data()?.claimedAt) return;
+          const amount = Math.max(1, Math.trunc(Number(freshEntitlementSnap.data()?.benefits?.ivResetCount || 1)));
+          const currentQty = Math.max(0, Number(itemSnap.data()?.quantity || 0));
+          const totalQuantity = Math.max(0, Number(metaSnap.data()?.totalQuantity || 0));
+          tx.set(
+            itemRef,
+            {
+              ...buildInventoryDoc({
+                id: "iv-reset-token",
+                name: "Reset IV",
+                description: "Reseta os IVs do Pokemon alvo.",
+                quantity: currentQty + amount,
+                effectType: "RESET_IV",
+              }),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            itemMetaRef,
+            {
+              totalQuantity: totalQuantity + amount,
+              limit: itemCapacityLimit,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            entitlementRef,
+            { claimedAt: serverTimestamp(), claimedByCharacterId: safeCharacterId, updatedAt: serverTimestamp() },
+            { merge: true }
+          );
+        });
+        continue;
+      }
+
+      if (isGymMainTeamSlotProduct(entry)) {
+        if (DEBUG_ECOIN_FLOW) {
+          console.log("[ECOIN_FLOW][sync:accept]", {
+            entitlementId: entry.id,
+            reason: "gym_main_team_slot_product",
+            targetPath: `players/${uid}/characters/${safeCharacterId}/itens/gym-main-team-slot-token`,
+          });
+        }
+        await runTransaction(db, async (tx) => {
+          const entitlementRef = doc(db, "players", uid, "productEntitlements", entry.id);
+          const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "gym-main-team-slot-token");
+          const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
+          const [freshEntitlementSnap, itemSnap, metaSnap] = await Promise.all([
+            tx.get(entitlementRef),
+            tx.get(itemRef),
+            tx.get(itemMetaRef),
+          ]);
+          if (!freshEntitlementSnap.exists() || freshEntitlementSnap.data()?.claimedAt) return;
+          const amount = Math.max(
+            1,
+            Math.trunc(
+              Number(
+                freshEntitlementSnap.data()?.benefits?.gymDefenseSlotsAdded ||
+                  freshEntitlementSnap.data()?.benefits?.gymMainTeamSlots ||
+                  parseMetadataNumber(freshEntitlementSnap.data()?.benefits?.metadata || {}, "slotsAdded", 1)
+              )
+            )
+          );
+          const currentQty = Math.max(0, Number(itemSnap.data()?.quantity || 0));
+          const totalQuantity = Math.max(0, Number(metaSnap.data()?.totalQuantity || 0));
+          tx.set(
+            itemRef,
+            {
+              ...buildInventoryDoc({
+                id: "gym-main-team-slot-token",
+                name: "Slot do time principal do GYM",
+                description: "Use na mochila do personagem para liberar um novo slot do time principal do GYM.",
+                quantity: currentQty + amount,
+                effectType: "ACTIVATE_GYM_MAIN_TEAM_SLOT",
+                metadata: {
+                  source: "monetization_product",
+                  productId: freshEntitlementSnap.data()?.productId || entry.productId,
+                  productCode: freshEntitlementSnap.data()?.productCode || entry.productCode || null,
+                },
+              }),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            itemMetaRef,
+            {
+              totalQuantity: totalQuantity + amount,
+              limit: itemCapacityLimit,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            entitlementRef,
+            { claimedAt: serverTimestamp(), claimedByCharacterId: safeCharacterId, updatedAt: serverTimestamp() },
+            { merge: true }
+          );
+        });
+        if (DEBUG_ECOIN_FLOW) {
+          console.log("[ECOIN_FLOW][sync:success]", {
+            entitlementId: entry.id,
+            targetPath: `players/${uid}/characters/${safeCharacterId}/itens/gym-main-team-slot-token`,
+          });
+        }
+        continue;
+      }
+
+      if (route.kind === "biome_access") {
+        await runTransaction(db, async (tx) => {
+          const entitlementRef = doc(db, "players", uid, "productEntitlements", entry.id);
+          const freshEntitlementSnap = await tx.get(entitlementRef);
+          if (!freshEntitlementSnap.exists() || freshEntitlementSnap.data()?.claimedAt) return;
+          const benefits = (freshEntitlementSnap.data()?.benefits || null) as any;
+          const biomeId = parseMetadataString(benefits, "biomeId");
+          if (!biomeId) return;
+          const accessDays = Math.max(
+            1,
+            Math.trunc(parseMetadataNumber(benefits, "biomeAccessDays", Number(entry.validUntilMs ? 0 : 7)))
+          );
+          const accessRef = doc(
+            db,
+            "players",
+            uid,
+            "characters",
+            safeCharacterId,
+            "biome_access",
+            biomeId
+          );
+          const validUntilMs =
+            Number(freshEntitlementSnap.data()?.validUntilMs || 0) || Date.now() + accessDays * 24 * 60 * 60 * 1000;
+          tx.set(
+            accessRef,
+            {
+              biomeId,
+              source: "monetization_product",
+              productId: freshEntitlementSnap.data()?.productId || entry.productId,
+              productCode: freshEntitlementSnap.data()?.productCode || entry.productCode || null,
+              validUntilMs,
+              updatedAt: serverTimestamp(),
+              createdAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            entitlementRef,
+            { claimedAt: serverTimestamp(), claimedByCharacterId: safeCharacterId, updatedAt: serverTimestamp() },
+            { merge: true }
+          );
+        });
+        continue;
+      }
+
+      if (route.kind === "eggs") {
+        await runTransaction(db, async (tx) => {
+          const entitlementRef = doc(db, "players", uid, "productEntitlements", entry.id);
+          const freshEntitlementSnap = await tx.get(entitlementRef);
+          if (!freshEntitlementSnap.exists() || freshEntitlementSnap.data()?.claimedAt) return;
+          const benefits = (freshEntitlementSnap.data()?.benefits || null) as any;
+          const pseudoChance = Math.max(0, Math.min(100, parseMetadataNumber(benefits, "pseudoLegendaryChancePercent", 5)));
+          const speciesId = pickShopEggSpecies({
+            pokemonType: productInfo.eggType === "type" ? String(productInfo.metadata?.pokemonType || "") : null,
+            pseudoChancePercent: pseudoChance,
+          });
+          const teamRefs = Array.from({ length: 6 }, (_, index) =>
+            doc(db, "players", uid, "characters", safeCharacterId, "time", `slot_${index + 1}`)
+          );
+          const teamSnaps = await Promise.all(teamRefs.map((ref) => tx.get(ref)));
+          const firstFreeTeamSlot = teamSnaps.findIndex((snap) => !snap.exists());
+          const reservedTeamSlot = firstFreeTeamSlot >= 0 ? firstFreeTeamSlot + 1 : null;
+          const storageLocation: "team" | "box" = reservedTeamSlot ? "team" : "box";
+          const eggRef = doc(collection(db, "players", uid, "characters", safeCharacterId, "eggs"));
+          tx.set(
+            eggRef,
+            {
+              speciesId,
+              speciesName: getSpeciesName(speciesId),
+              stepsRequired: getSpeciesHatchSteps(speciesId),
+              stepsProgress: 0,
+              inheritedEggMoves: [],
+              status: "stored",
+              source: "shop",
+              hatchMode: "time",
+              readyAtMs: null,
+              requiresIncubator: true,
+              incubatorAssignedAt: null,
+              startedAt: null,
+              endsAt: null,
+              startedAtMs: null,
+              endsAtMs: null,
+              incubatorId: null,
+              storageLocation,
+              storageSlotIndex: reservedTeamSlot,
+              purchasedFromProductId: freshEntitlementSnap.data()?.productId || entry.productId,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          tx.set(
+            entitlementRef,
+            {
+              claimedAt: serverTimestamp(),
+              claimedByCharacterId: safeCharacterId,
+              generatedEggId: eggRef.id,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+        });
+      }
+    }
   }
 
   async function loadDaycareState(tierOverride?: "FREE" | "VIP") {
@@ -1795,6 +2735,12 @@ export default function GameScreen() {
       const readyByTime = hatchMode === "time" && readyAtMs > 0 && Date.now() >= readyAtMs;
       const ready = status === "ready" || readyBySteps || readyByTime;
       if (!ready) throw new Error("Ovo ainda nao esta pronto para chocar.");
+      const currentCapturedCount =
+        team.filter((entry) => Number(entry.speciesId) > 0).length +
+        box.filter((entry) => Number(entry.speciesId) > 0).length;
+      if (currentCapturedCount >= captureCapacityLimit) {
+        throw new Error(`Limite de Pokemon atingido (${captureCapacityLimit}).`);
+      }
 
       const speciesId = Math.max(1, Number(egg?.speciesId || 1));
       const speciesName = String(egg?.speciesName || getSpeciesName(speciesId));
@@ -1806,17 +2752,32 @@ export default function GameScreen() {
         .filter((m: string) => getEggMovesForSpecies(speciesId).includes(m));
 
       let chosenSlot: number | null = null;
-      for (let slot = 1; slot <= 6; slot++) {
-        const slotRef = doc(db, "players", uid, "characters", safeCharacterId, "time", `slot_${slot}`);
-        const slotSnap = await tx.get(slotRef);
-        if (!slotSnap.exists()) {
-          chosenSlot = slot;
-          break;
+      const reservedSlot = Math.max(0, Number(egg?.storageLocation === "team" ? egg?.storageSlotIndex || 0 : 0));
+      if (reservedSlot > 0) {
+        const reservedRef = doc(db, "players", uid, "characters", safeCharacterId, "time", `slot_${reservedSlot}`);
+        const reservedSnap = await tx.get(reservedRef);
+        if (!reservedSnap.exists()) {
+          chosenSlot = reservedSlot;
+        } else {
+          const reservedData = reservedSnap.data() as TeamPokemonDoc;
+          if (!Number.isFinite(Number(reservedData?.speciesId)) || Number(reservedData.speciesId) <= 0) {
+            chosenSlot = reservedSlot;
+          }
         }
-        const slotData = slotSnap.data() as TeamPokemonDoc;
-        if (!Number.isFinite(Number(slotData?.speciesId)) || Number(slotData.speciesId) <= 0) {
-          chosenSlot = slot;
-          break;
+      }
+      if (chosenSlot == null) {
+        for (let slot = 1; slot <= 6; slot++) {
+          const slotRef = doc(db, "players", uid, "characters", safeCharacterId, "time", `slot_${slot}`);
+          const slotSnap = await tx.get(slotRef);
+          if (!slotSnap.exists()) {
+            chosenSlot = slot;
+            break;
+          }
+          const slotData = slotSnap.data() as TeamPokemonDoc;
+          if (!Number.isFinite(Number(slotData?.speciesId)) || Number(slotData.speciesId) <= 0) {
+            chosenSlot = slot;
+            break;
+          }
         }
       }
 
@@ -1925,6 +2886,7 @@ export default function GameScreen() {
     const hatchMode = options?.hatchMode === "time" ? "time" : "steps";
     const readyAtMs = hatchMode === "time" ? Math.max(0, Number(options?.readyAtMs || 0)) : 0;
     const requiresIncubator = hatchMode === "steps" ? !!options?.requiresIncubator : false;
+    const isStoredEgg = requiresIncubator && hatchMode !== "time";
     tx.set(eggRef, {
       speciesId: egg.speciesId,
       speciesName: egg.speciesName,
@@ -1932,12 +2894,17 @@ export default function GameScreen() {
       stepsProgress: egg.stepsProgress,
       inheritedEggMoves: egg.inheritedEggMoves,
       parentSpeciesIds: egg.parentSpeciesIds ?? [],
-      status: hatchMode === "time" && readyAtMs > 0 && Date.now() >= readyAtMs ? "ready" : egg.status,
+      status: isStoredEgg ? "stored" : hatchMode === "time" && readyAtMs > 0 && Date.now() >= readyAtMs ? "ready" : egg.status,
       source,
       hatchMode,
       readyAtMs: hatchMode === "time" ? readyAtMs : null,
       requiresIncubator,
       incubatorAssignedAt: null,
+      startedAt: null,
+      endsAt: null,
+      startedAtMs: null,
+      endsAtMs: hatchMode === "time" ? readyAtMs : null,
+      incubatorId: null,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -1986,15 +2953,34 @@ export default function GameScreen() {
     }
   }
 
-  async function assignIncubatorToEgg(eggId: string): Promise<ActionResult> {
+  async function assignIncubatorToEgg(eggId: string, incubatorItemId?: string): Promise<ActionResult> {
     if (!uid || !safeCharacterId) return { ok: false, message: "Sessao invalida." };
     const targetEggId = String(eggId || "").trim();
     if (!targetEggId) return { ok: false, message: "Ovo invalido." };
+    const availableIncubators = bagItems
+      .filter((item) => item.id === EGG_INCUBATOR_ITEM_ID || item.id.startsWith(`${EGG_INCUBATOR_ITEM_ID}-`))
+      .filter((item) => item.quantity > 0)
+      .map((item) => ({
+        item,
+        hatchDays:
+          Math.max(
+            1,
+            Number(
+              (item.metadata as Record<string, unknown> | null)?.incubatorDays ||
+                (String(item.id).match(/egg-incubator-(\d+)d/)?.[1] ?? 0) ||
+                3
+            )
+          ),
+      }))
+      .sort((a, b) => a.hatchDays - b.hatchDays);
+    const selectedIncubator =
+      availableIncubators.find((entry) => entry.item.id === incubatorItemId) || availableIncubators[0] || null;
+    if (!selectedIncubator) return { ok: false, message: "Voce nao possui incubadora disponivel." };
 
     try {
       await runTransaction(db, async (tx) => {
         const eggRef = doc(db, "players", uid, "characters", safeCharacterId, "eggs", targetEggId);
-        const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", EGG_INCUBATOR_ITEM_ID);
+        const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", selectedIncubator.item.id);
         const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
         const [eggSnap, itemSnap, metaSnap] = await Promise.all([
           tx.get(eggRef),
@@ -2004,12 +2990,12 @@ export default function GameScreen() {
 
         if (!eggSnap.exists()) throw new Error("Ovo nao encontrado.");
         const egg = eggSnap.data() as any;
-        const status = String(egg?.status || "incubating");
+        const status = String(egg?.status || "stored");
         const hatchMode = String(egg?.hatchMode || "steps") === "time" ? "time" : "steps";
         if (status === "ready" || status === "hatched") throw new Error("Esse ovo ja esta pronto.");
-        if (hatchMode === "time") throw new Error("Ovos do daycare por tempo nao precisam de chocadeira.");
-        if (!egg?.requiresIncubator) throw new Error("Esse ovo nao exige chocadeira.");
-        if (egg?.incubatorAssignedAt) throw new Error("Esse ovo ja possui chocadeira ativa.");
+        if (status !== "stored" && hatchMode === "time") throw new Error("Esse ovo ja esta incubando.");
+        if (!egg?.requiresIncubator && status !== "stored") throw new Error("Esse ovo nao exige incubadora.");
+        if (egg?.incubatorAssignedAt || egg?.incubatorId) throw new Error("Esse ovo ja possui incubadora ativa.");
 
         if (!itemSnap.exists()) throw new Error("Voce nao possui chocadeira.");
         const qty = Math.max(0, Number(itemSnap.data()?.quantity || 0));
@@ -2026,17 +3012,31 @@ export default function GameScreen() {
           { merge: true }
         );
 
+        const startedAtMs = Date.now();
+        const endsAtMs = startedAtMs + selectedIncubator.hatchDays * 24 * 60 * 60 * 1000;
         tx.set(
           eggRef,
-          { incubatorAssignedAt: serverTimestamp(), updatedAt: serverTimestamp() },
+          {
+            status: "incubating",
+            hatchMode: "time",
+            requiresIncubator: false,
+            incubatorAssignedAt: serverTimestamp(),
+            incubatorId: selectedIncubator.item.id,
+            startedAt: new Date(startedAtMs),
+            endsAt: new Date(endsAtMs),
+            startedAtMs,
+            endsAtMs,
+            readyAtMs: endsAtMs,
+            updatedAt: serverTimestamp(),
+          },
           { merge: true }
         );
       });
 
       await Promise.all([loadBagFromFirestore(), loadEggsFromFirestore()]);
-      return { ok: true, message: "Chocadeira aplicada ao ovo." };
+      return { ok: true, message: `Incubacao iniciada. O ovo ficara pronto em ${selectedIncubator.hatchDays} dia(s).` };
     } catch (e: any) {
-      return { ok: false, message: e?.message || "Falha ao aplicar chocadeira." };
+      return { ok: false, message: e?.message || "Falha ao iniciar incubacao." };
     }
   }
 
@@ -2244,20 +3244,114 @@ export default function GameScreen() {
       await runTransaction(db, async (tx) => {
         const itemRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", itemId);
         const itemMetaRef = doc(db, "players", uid, "characters", safeCharacterId, "itens", "_meta");
-
-        const [itemSnap, monSnap, itemMetaSnap] = await Promise.all([
-          tx.get(itemRef),
-          tx.get(slotRef),
-          tx.get(itemMetaRef),
-        ]);
+        const itemSnap = await tx.get(itemRef);
+        const itemMetaSnap = await tx.get(itemMetaRef);
 
         if (!itemSnap.exists()) throw new Error("Item nao encontrado no inventario.");
-        if (!monSnap.exists()) throw new Error("Pokemon alvo nao encontrado.");
 
         const itemData = itemSnap.data() as InventoryDoc;
-        const mon = monSnap.data() as TeamPokemonDoc;
         const qty = Number(itemData.quantity || 0);
         if (qty <= 0) throw new Error("Quantidade insuficiente.");
+        const consumeItem = () => {
+          const nextQty = qty - 1;
+          if (nextQty <= 0) {
+            tx.delete(itemRef);
+          } else {
+            tx.update(itemRef, { quantity: nextQty, updatedAt: serverTimestamp() });
+          }
+          const total = Number(itemMetaSnap.data()?.totalQuantity ?? 0);
+          tx.set(
+            itemMetaRef,
+            {
+              totalQuantity: Math.max(0, total - 1),
+              limit: itemCapacityLimit,
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+        };
+
+        if (itemData.effectType === "UNLOCK_GYM_SCENARIO") {
+          const scenarioId = String(itemData.metadata?.scenarioId || itemData.metadata?.itemId || "").trim().toLowerCase();
+          if (!scenarioId) throw new Error("Cenario invalido para ativacao.");
+          const unlockRef = doc(db, "players", uid, "gymScenarioUnlocks", scenarioId);
+          const unlockSnap = await tx.get(unlockRef);
+          if (unlockSnap.exists()) throw new Error("Esse cenario ja foi ativado.");
+          tx.set(
+            unlockRef,
+            {
+              kind: "scenario",
+              itemId: scenarioId,
+              itemName: itemData.name || "Cenario",
+              sourceItemId: itemId,
+              activatedByCharacterId: safeCharacterId,
+              unlockedAt: serverTimestamp(),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          consumeItem();
+          return;
+        }
+
+        if (itemData.effectType === "UNLOCK_GYM_NPC") {
+          const npcId = String(itemData.metadata?.npcId || itemData.metadata?.itemId || "").trim().toLowerCase();
+          if (!npcId) throw new Error("NPC invalido para ativacao.");
+          const unlockRef = doc(db, "players", uid, "gymNpcUnlocks", npcId);
+          const unlockSnap = await tx.get(unlockRef);
+          if (unlockSnap.exists()) throw new Error("Esse NPC ja foi ativado.");
+          tx.set(
+            unlockRef,
+            {
+              kind: "npc",
+              itemId: npcId,
+              itemName: itemData.name || "NPC",
+              sourceItemId: itemId,
+              activatedByCharacterId: safeCharacterId,
+              unlockedAt: serverTimestamp(),
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          consumeItem();
+          return;
+        }
+
+        if (itemData.effectType === "ACTIVATE_GYM_MAIN_TEAM_SLOT") {
+          const gymRef = doc(db, "gyms", uid);
+          const gymSnap = await tx.get(gymRef);
+          if (!gymSnap.exists()) throw new Error("Crie um GYM antes de usar esse slot.");
+          const gymData = gymSnap.data() as PlayerGymDoc;
+          if (String(gymData.ownerCharacterId || "").trim() !== safeCharacterId) {
+            throw new Error("Esse slot so pode ser usado no GYM do personagem atual.");
+          }
+          const currentLimit = Math.max(1, Math.min(6, Number(gymData.totalSlots || gymData.mainTeamSlotLimit || 1)));
+          if (currentLimit >= 6) throw new Error("Seu GYM ja atingiu o limite maximo de 6 slots.");
+          const nextLimit = Math.min(6, currentLimit + 1);
+          tx.set(
+            gymRef,
+            {
+              mainTeamSlotLimit: nextLimit,
+              totalSlots: nextLimit,
+              extraSlotsApplied: Math.max(0, nextLimit - 1),
+              upgrades: {
+                ...(gymData.upgrades || {}),
+                mainTeamSlotsAdded: Math.max(0, nextLimit - 1),
+              },
+              updatedAtMs: Date.now(),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          consumeItem();
+          return;
+        }
+
+        const monSnap = await tx.get(slotRef);
+        if (!monSnap.exists()) throw new Error("Pokemon alvo nao encontrado.");
+        const mon = monSnap.data() as TeamPokemonDoc;
 
         const hpCurrent = Number(mon.hp?.current ?? 0);
         const hpTotal = Number(mon.hp?.total ?? 0);
@@ -2395,6 +3489,46 @@ export default function GameScreen() {
             pendingLearnMove: moveApply.pendingLearnMove,
             updatedAt: serverTimestamp(),
           });
+        } else if (itemData.effectType === "RESET_IV") {
+          const level = Math.max(1, Number(mon.level || 1));
+          const nextIvs = {
+            hp: Math.floor(Math.random() * 32),
+            atk: Math.floor(Math.random() * 32),
+            def: Math.floor(Math.random() * 32),
+            spa: Math.floor(Math.random() * 32),
+            spd: Math.floor(Math.random() * 32),
+            spe: Math.floor(Math.random() * 32),
+          };
+          const currentEvs = mon.evs ?? { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 };
+          const base = resolveBaseStats(Math.max(1, Number(mon.speciesId || 1)));
+          const real = base
+            ? calcRealStats({
+              level,
+              nature: mon.nature ?? "Docile",
+              base,
+              ivs: nextIvs,
+              evs: currentEvs,
+            })
+            : null;
+          tx.update(slotRef, {
+            ivs: nextIvs,
+            ...(real
+              ? {
+                stats: {
+                  atk: real.atk,
+                  def: real.def,
+                  spa: real.spa,
+                  spd: real.spd,
+                  spe: real.spe,
+                },
+                hp: {
+                  current: Math.max(1, Math.min(real.hp, Number(mon.hp?.current ?? real.hp))),
+                  total: real.hp,
+                },
+              }
+              : {}),
+            updatedAt: serverTimestamp(),
+          });
         } else {
           throw new Error("Efeito desse item ainda nao foi implementado.");
         }
@@ -2415,7 +3549,7 @@ export default function GameScreen() {
           itemMetaRef,
           {
             totalQuantity: Math.max(0, total - totalDelta),
-            limit: BAG_LIMIT_BY_PLAYER[playerType],
+            limit: itemCapacityLimit,
             updatedAt: serverTimestamp(),
           },
           { merge: true }
@@ -2841,7 +3975,7 @@ export default function GameScreen() {
 
   async function throwPokeballWithEncounter(
     ballId: string,
-    encounterData: WildEncounter & { biomeId?: string }
+    encounterData: EffectiveEncounter
   ): Promise<ActionResult> {
     if (!uid || !safeCharacterId) return { ok: false, message: "Sessao invalida." };
     const versionMap = await ensureVersionConfigMap();
@@ -2872,6 +4006,12 @@ export default function GameScreen() {
 
         let chosenSlot: number | null = null;
         if (success) {
+          const currentCapturedCount =
+            team.filter((entry) => Number(entry.speciesId) > 0).length +
+            box.filter((entry) => Number(entry.speciesId) > 0).length;
+          if (currentCapturedCount >= captureCapacityLimit) {
+            throw new Error(`Limite de Pokemon atingido (${captureCapacityLimit}).`);
+          }
           for (let slot = 1; slot <= 6; slot++) {
             const slotRef = doc(db, "players", uid, "characters", safeCharacterId, "time", `slot_${slot}`);
             const slotSnap = await tx.get(slotRef);
@@ -2897,7 +4037,7 @@ export default function GameScreen() {
           ballMetaRef,
           {
             totalQuantity: Math.max(0, total - 1),
-            limit: BAG_LIMIT_BY_PLAYER[playerType],
+            limit: pokeballCapacityLimit,
             updatedAt: serverTimestamp(),
           },
           { merge: true }
@@ -2955,6 +4095,7 @@ export default function GameScreen() {
             isAbandoned: false,
             traumaRecovered: false,
             bondBuff: false,
+            isShiny: !!encounterData.isShiny,
             learnsetConstraints: capturedConstraints,
             isStarter: false,
             capturedAt: serverTimestamp(),
@@ -3004,7 +4145,7 @@ export default function GameScreen() {
 
   async function tryCaptureFromExplore(payload: {
     ballId: string;
-    encounter: { speciesId: number; speciesName: string; level: number; hpCurrent: number; hpTotal: number; biomeId?: string; moves?: string[] };
+    encounter: { speciesId: number; speciesName: string; level: number; hpCurrent: number; hpTotal: number; biomeId?: string; moves?: string[]; isShiny?: boolean };
   }): Promise<ActionResult> {
     return throwPokeballWithEncounter(payload.ballId, {
       speciesId: Number(payload.encounter.speciesId),
@@ -3015,6 +4156,7 @@ export default function GameScreen() {
       biomeId: payload.encounter.biomeId ? String(payload.encounter.biomeId) : undefined,
       spriteUrl: getPokemonSpriteUrl(Number(payload.encounter.speciesId)),
       moves: payload.encounter.moves,
+      isShiny: !!payload.encounter.isShiny,
     });
   }
 
@@ -3027,7 +4169,6 @@ export default function GameScreen() {
     if (!uniqueSlots.length) return;
 
     const baseGain = Math.max(1, 12 + Math.floor(Number(payload.level || 1) * 3));
-    const gain = Math.max(1, Math.floor(baseGain / uniqueSlots.length));
     const evYield = await resolveEvYieldOfficialOrFallback(Number(payload.speciesId || 0));
 
     await runTransaction(db, async (tx) => {
@@ -3043,6 +4184,14 @@ export default function GameScreen() {
         if (!monSnap.exists()) continue;
 
         const mon = monSnap.data() as TeamPokemonDoc;
+        const pokemonTypes = getSpeciesTypesLocal(Number(mon.speciesId || 0));
+        const slotMultiplier = resolveGymTypeXpMultiplier({
+          baseMultiplier: xpMultiplier,
+          gymType: playerGym?.active ? playerGym.gymType : null,
+          gymXpBonusPercent: playerGym?.active ? playerGym.xpBonusPercent : 0,
+          pokemonTypes,
+        });
+        const gain = Math.max(1, Math.floor(Math.max(1, Math.round(baseGain * slotMultiplier)) / uniqueSlots.length));
 
         let nextLevel = Math.max(1, Number(mon.level || 1));
         let expCurrent = Math.max(0, Number(mon.exp?.current ?? 0)) + gain;
@@ -3327,6 +4476,65 @@ export default function GameScreen() {
     }
   }
 
+  async function sendPlayerTeamPokemonToGymStorage(teamSlotIndex: number): Promise<ActionResult> {
+    if (!uid || !safeCharacterId || !playerGym?.active) {
+      return { ok: false, message: "GYM indisponivel para essa conta." };
+    }
+
+    const slot = Math.max(1, Math.min(6, Number(teamSlotIndex || 1)));
+    const mon = team[slot - 1];
+    if (!mon || Number(mon.speciesId || 0) <= 0) {
+      return { ok: false, message: "Selecione um Pokemon valido do time." };
+    }
+
+    try {
+      await addPokemonToGymStorage({
+        uid,
+        characterId: safeCharacterId,
+        sourceCollection: "time",
+        sourceDocId: `slot_${slot}`,
+      });
+      return { ok: true, message: "Pokemon enviado para o storage do GYM." };
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Falha ao enviar Pokemon para o GYM." };
+    }
+  }
+
+  async function moveGymStorageToMainTeam(storageIndex: number, teamSlotIndex: number): Promise<ActionResult> {
+    if (!uid || !playerGym?.active) return { ok: false, message: "GYM nao encontrado." };
+    const storageMon = gymStorage[Math.max(0, Number(storageIndex || 0))];
+    if (!storageMon?.id) return { ok: false, message: "Pokemon do storage nao encontrado." };
+
+    const slot = Math.max(1, Math.min(gymSlotLimit, Number(teamSlotIndex || 1)));
+    const target = activeGymTeam[slot - 1];
+
+    try {
+      if (target && Number(target.speciesId || 0) > 0) {
+        await removePokemonFromGymMainTeam(uid, String(target.id));
+      }
+      await addPokemonToGymMainTeam(uid, String(storageMon.id));
+      return { ok: true, message: "Pokemon movido para o time principal do GYM." };
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Falha ao atualizar o time principal do GYM." };
+    }
+  }
+
+  async function removeGymMainTeamPokemon(teamSlotIndex: number): Promise<ActionResult> {
+    if (!uid || !playerGym?.active) return { ok: false, message: "GYM nao encontrado." };
+    const slot = Math.max(1, Math.min(gymSlotLimit, Number(teamSlotIndex || 1)));
+    const target = activeGymTeam[slot - 1];
+    if (!target || Number(target.speciesId || 0) <= 0) {
+      return { ok: false, message: "Selecione um Pokemon do time principal do GYM." };
+    }
+
+    try {
+      await removePokemonFromGymMainTeam(uid, String(target.id));
+      return { ok: true, message: "Pokemon removido do time principal do GYM." };
+    } catch (e: any) {
+      return { ok: false, message: e?.message || "Falha ao remover Pokemon do time do GYM." };
+    }
+  }
+
   async function replaceTeamWithBox(teamSlotIndex: number, boxSlotIndex: number | null): Promise<ActionResult> {
     const slot = Math.max(1, Math.min(6, Number(teamSlotIndex || 1)));
     if (boxSlotIndex === null) {
@@ -3494,6 +4702,56 @@ export default function GameScreen() {
     );
   }
 
+  function toggleNurseSlot(slotIndex: number) {
+    setNurseSelectedSlots((current) =>
+      current.includes(slotIndex) ? current.filter((value) => value !== slotIndex) : [...current, slotIndex].slice(0, 6)
+    );
+  }
+
+  async function healSelectedTeamAtNurse() {
+    if (!uid || !safeCharacterId) return;
+    const selectedSlots = Array.from(new Set(nurseSelectedSlots)).filter((slot) => slot >= 1 && slot <= 6);
+    if (!selectedSlots.length) {
+      Alert.alert("Enfermeira", "Selecione ao menos um Pokemon para curar.");
+      return;
+    }
+
+    const selectedMons = selectedSlots
+      .map((slot) => ({ slot, mon: team[slot - 1] }))
+      .filter(({ mon }) => mon && Number(mon.speciesId) > 0);
+    const totalCost = selectedMons.length * 50;
+    if (Math.max(0, Number(character?.pokeCoins || 0)) < totalCost) {
+      Alert.alert("Enfermeira", `Moedas insuficientes. Necessario: ${totalCost}.`);
+      return;
+    }
+
+    const batch = writeBatch(db);
+    for (const { slot, mon } of selectedMons) {
+      const slotRef = doc(db, "players", uid, "characters", safeCharacterId, "time", `slot_${slot}`);
+      const hpTotal = Math.max(1, Number(mon.hpTotal || 1));
+      batch.set(slotRef, { hp: { current: hpTotal, total: hpTotal }, updatedAt: serverTimestamp() }, { merge: true });
+    }
+    batch.set(
+      doc(db, "players", uid, "characters", safeCharacterId),
+      { pokeCoins: Math.max(0, Number(character?.pokeCoins || 0)) - totalCost, updatedAt: serverTimestamp() },
+      { merge: true }
+    );
+    await batch.commit();
+
+    setCharacter((prev) => (prev ? { ...prev, pokeCoins: Math.max(0, Number(prev.pokeCoins || 0)) - totalCost } : prev));
+    setTeam((prev) =>
+      prev.map((mon, index) =>
+        selectedSlots.includes(index + 1) && Number(mon.speciesId) > 0
+          ? { ...mon, hpCurrent: Math.max(1, Number(mon.hpTotal || 1)) }
+          : mon
+      )
+    );
+    setNurseSelectedSlots([]);
+    setNurseModalVisible(false);
+    setNurseMode("menu");
+    Alert.alert("Enfermeira", `${selectedMons.length} Pokemon curado(s) por ${totalCost} moedas.`);
+  }
+
   useEffect(() => {
     let isMounted = true;
 
@@ -3523,6 +4781,7 @@ export default function GameScreen() {
         setCharacter(data);
 
         await ensureCharacterSubcollections();
+        await syncLegacyGymSlotRewardsFromAccountBackpack();
 
         // ✅ TIME + BOX VEM DO FIRESTORE
         await reloadTeamAndBox(data);
@@ -3544,6 +4803,135 @@ export default function GameScreen() {
       isMounted = false;
     };
   }, [uid, safeCharacterId]);
+
+  useEffect(() => {
+    if (!uid) return;
+    const unsub = listenPlayerProductEntitlements(uid, (entries) => {
+      setProductEntitlements(entries);
+    });
+    return () => unsub();
+  }, [uid]);
+
+  useEffect(() => {
+    if (!uid || !safeCharacterId) return;
+    const unsub = listenPlayerGymByCharacter(uid, safeCharacterId, (gym) => {
+      setPlayerGym(gym);
+    });
+    return () => unsub();
+  }, [uid, safeCharacterId]);
+
+  useEffect(() => {
+    if (!uid || !playerGym?.active) {
+      setGymMainTeam([]);
+      setGymStorage([]);
+      return;
+    }
+
+    const toGymUi = (rows: GymRosterEntry[], fillTo: number) => {
+      const mapped: TeamPokemonUI[] = rows.slice(0, Math.max(1, fillTo)).map((row, idx) => {
+        const level = Math.max(1, Number(row.level || 1));
+        const hpTotal = Math.max(1, 20 + level * 2);
+        return {
+          id: row.id || `gym-slot-${idx + 1}`,
+          speciesId: Number(row.speciesId || 0),
+          name: String(row.speciesName || `#${row.speciesId || 0}`),
+          nickname: row.nickname || undefined,
+          level,
+          nature: "—",
+          gender: "—" as const,
+          hpCurrent: hpTotal,
+          hpTotal,
+          expCurrent: 0,
+          expToNext: 100,
+          spriteUrl: row.spriteUrl || getPokemonSpriteUrl(Number(row.speciesId || 0)),
+          moves: [],
+        };
+      });
+
+      while (mapped.length < fillTo) {
+        mapped.push({
+          id: `gym-empty-${mapped.length + 1}`,
+          speciesId: 0,
+          name: "Slot vazio",
+          nickname: undefined,
+          level: 0,
+          nature: "—",
+          gender: "—" as const,
+          hpCurrent: 0,
+          hpTotal: 0,
+          expCurrent: 0,
+          expToNext: 0,
+          spriteUrl: null,
+          moves: [],
+        });
+      }
+
+      return mapped;
+    };
+
+    const unsubMainTeam = listenGymMainTeam(uid, (rows) => {
+      setGymMainTeam(toGymUi(rows, Math.max(1, Math.min(6, Number(playerGym?.mainTeamSlotLimit || 1)))));
+    });
+    const unsubStorage = listenGymStorage(uid, (rows) => {
+      setGymStorage(toGymUi(rows, rows.length));
+    });
+    return () => {
+      unsubMainTeam();
+      unsubStorage();
+    };
+  }, [uid, playerGym?.active, playerGym?.mainTeamSlotLimit]);
+
+  useEffect(() => {
+    if (playerGym?.active) return;
+    setGymMode(false);
+  }, [playerGym?.active]);
+
+  useEffect(() => {
+    if (openGymBox !== "1" || !playerGym?.active) return;
+    setGymMode(true);
+    setBoxVisible(true);
+  }, [openGymBox, playerGym?.active]);
+
+  useEffect(() => {
+    if (openStore !== "1") return;
+    setActiveAction("SHOP");
+  }, [openStore]);
+
+  useEffect(() => {
+    if (!DEBUG_ECOIN_FLOW) return;
+    console.log("[ECOIN_FLOW][game:characterContext]", {
+      uid,
+      characterId,
+      safeCharacterId,
+    });
+  }, [characterId, safeCharacterId, uid]);
+
+  useEffect(() => {
+    const next = clampGymFabPosition(screenWidth - gymFabSize - 18, screenHeight - 220);
+    if (!gymFabInitialized.current) {
+      gymFabInitialized.current = true;
+      gymFabLastPosition.current = next;
+      gymFabPosition.setValue(next);
+      return;
+    }
+    if (!playerGym?.active) return;
+    gymFabLastPosition.current = clampGymFabPosition(gymFabLastPosition.current.x, gymFabLastPosition.current.y);
+    gymFabPosition.setValue(gymFabLastPosition.current);
+  }, [gymFabPosition, playerGym?.active, screenHeight, screenWidth]);
+
+  useEffect(() => {
+    if (!uid || !safeCharacterId || !activeVipBenefits) return;
+    syncWeeklyVipIncubator()
+      .then(() => loadBagFromFirestore())
+      .catch(() => undefined);
+  }, [uid, safeCharacterId, activeVipBenefits?.weeklyIncubators]);
+
+  useEffect(() => {
+    if (!uid || !safeCharacterId || productEntitlements.length === 0) return;
+    syncMonetizationEntitlements()
+      .then(() => loadBagFromFirestore())
+      .catch(() => undefined);
+  }, [uid, safeCharacterId, productEntitlements]);
 
   useEffect(() => {
     if (!uid || !safeCharacterId) return;
@@ -3652,11 +5040,14 @@ export default function GameScreen() {
                     {/* Infos */}
                     <View style={styles.characterInfo}>
                       <View style={styles.characterNameRow}>
-                        <Text style={styles.characterName}>{character.name}</Text>
-                        <Pressable style={styles.pcBtn} onPress={() => setBoxVisible(true)}>
-                          <Monitor size={16} color={COLORS.white} />
-                          <Text style={styles.pcBtnText}>BOX</Text>
-                        </Pressable>
+                        <Text style={styles.characterName} numberOfLines={1} ellipsizeMode="tail">
+                          {character.name}
+                        </Text>
+                        <View style={styles.headerActionRow}>
+                          <Pressable style={styles.pcBtn} onPress={() => setBoxVisible(true)}>
+                            <Monitor size={16} color={COLORS.white} />
+                          </Pressable>
+                        </View>
                       </View>
 
                       <View style={styles.pillsRow}>
@@ -3666,6 +5057,11 @@ export default function GameScreen() {
                         <View style={styles.pill}>
                           <Text style={styles.pillText}>{classLabel}</Text>
                         </View>
+                        {gymMode && playerGym?.active ? (
+                          <View style={[styles.pill, styles.gymPill]}>
+                            <Text style={styles.pillText}>{playerGym.name} • {playerGym.gymType}</Text>
+                          </View>
+                        ) : null}
                       </View>
 
                       <View style={styles.metricsRow}>
@@ -3693,7 +5089,7 @@ export default function GameScreen() {
                     <Mochila
                       bagTab={bagTab}
                       setBagTab={setBagTab}
-                      team={team}
+                      team={displayedBagTeam}
                       box={box}
                       // ✅ callbacks que escrevem no Firestore (o modal/UX fica na Mochila)
                       onRenamePokemon={renamePokemonOnce}
@@ -3718,7 +5114,7 @@ export default function GameScreen() {
                       allowTutor={!!biomeNpcAccess?.canTutor}
                       allowedTutorType={biomeNpcAccess?.tutorType ?? null}
                     />
-                    {biomeNpcAccess?.canBreeding ? (
+                    {biomeNpcAccess?.canBreeding || eggs.length > 0 || incubatorCount > 0 ? (
                       <EggsPanel
                         eggs={eggs}
                         team={team}
@@ -3735,6 +5131,7 @@ export default function GameScreen() {
                         daycareUnlocked={daycareUnlocked}
                         daycareUnlockHint={daycareUnlockHint}
                         incubatorCount={incubatorCount}
+                        incubators={eggIncubators}
                         onHatchEgg={async (eggId) => {
                           try {
                             await hatchEgg(eggId);
@@ -3747,8 +5144,8 @@ export default function GameScreen() {
                           const result = await createEggFromTeamSlots(slotA, slotB);
                           Alert.alert("Breeding", result.message);
                         }}
-                        onAssignIncubator={async (eggId) => {
-                          const result = await assignIncubatorToEgg(eggId);
+                        onAssignIncubator={async (eggId, incubatorId) => {
+                          const result = await assignIncubatorToEgg(eggId, incubatorId);
                           Alert.alert("Chocadeira", result.message);
                         }}
                         onSetDaycareParents={async (slotA, slotB) => {
@@ -3771,7 +5168,12 @@ export default function GameScreen() {
                     uid={uid}
                     characterId={safeCharacterId}
                     characterRegion={character?.region}
+                    onBiomeChanged={({ biomeId }) => {
+                      setActiveExploreBiomeId(String(biomeId || "").trim().toLowerCase());
+                    }}
                     team={team}
+                    trainerLicenseBiomeIds={trainerBiomeAccessIds}
+                    trainerShinyBonusPercent={trainerShinyBonusPercent}
                     onPokemonCenterHeal={healTeamAtPokemonCenter}
                     pokeballs={bagPokeballs}
                     onBattleTeamSync={syncBattleTeamHp}
@@ -3783,7 +5185,9 @@ export default function GameScreen() {
                     }}
                     onNpcAction={async (payload) => {
                       if (payload.role === "nurse") {
-                        await healTeamAtPokemonCenter();
+                        setNurseSelectedSlots([]);
+                        setNurseMode("menu");
+                        setNurseModalVisible(true);
                         return;
                       }
                       if (payload.role === "breeder") {
@@ -3840,6 +5244,8 @@ export default function GameScreen() {
                     trainerName={character?.name}
                     characterRegion={character?.region}
                     team={team}
+                    playerGym={playerGym}
+                    moneyRewardMultiplier={moneyMultiplier}
                     onBattleTeamSync={syncBattleTeamHp}
                     onNpcVictoryExp={grantExploreExpToLead}
                   />
@@ -3852,6 +5258,7 @@ export default function GameScreen() {
                       setCharacter((prev) => (prev ? { ...prev, pokeCoins: nextCoins } : prev))
                     }
                     onInventoryChanged={async () => {
+                      await syncLegacyGymSlotRewardsFromAccountBackpack();
                       await loadBagFromFirestore();
                     }}
                   />
@@ -3866,6 +5273,24 @@ export default function GameScreen() {
           </ScrollView>
 
           {/* MENU INFERIOR (componentizado) */}
+          {playerGym?.active ? (
+            <Animated.View
+              style={[styles.gymFloatingButtonWrap, { transform: gymFabPosition.getTranslateTransform() }]}
+              {...gymFabPanResponder.panHandlers}
+            >
+              <Pressable
+                style={styles.gymFloatingButton}
+                onPress={() =>
+                  router.push({
+                    pathname: "/gym",
+                    params: { characterId: safeCharacterId, mode: "manage", biomeId: currentBiomeGymId || currentBiomeId },
+                  })
+                }
+              >
+                <Shield size={22} color={COLORS.white} />
+              </Pressable>
+            </Animated.View>
+          ) : null}
           <GameMenu
             activeAction={activeAction}
             onChange={(key) => {
@@ -3873,27 +5298,149 @@ export default function GameScreen() {
             }}
           />
 
-          <Modal visible={boxVisible} animationType="slide" onRequestClose={() => setBoxVisible(false)}>
+          <Modal visible={nurseModalVisible} transparent animationType="fade" onRequestClose={() => setNurseModalVisible(false)}>
+            <View style={styles.modalOverlay}>
+              <View style={[styles.modalWrap, { maxWidth: 420 }]}>
+                <LinearGradient colors={["#0f172a", "#111827"]} style={styles.modalCard}>
+                  <View style={styles.modalGlow} />
+                  <View style={styles.modalTopRow}>
+                    <View style={styles.modalLeft}>
+                      <Text style={styles.modalTitle}>Enfermeira</Text>
+                      <Text style={styles.modalSubtitle}>
+                        {nurseMode === "menu"
+                          ? "Escolha entre curar o time ou iniciar o registro do GYM."
+                          : "Selecione ate 6 Pokemon do time para curar por 50 moedas cada."}
+                      </Text>
+                    </View>
+                    <Pressable
+                      onPress={() => {
+                        setNurseModalVisible(false);
+                        setNurseMode("menu");
+                        setNurseSelectedSlots([]);
+                      }}
+                      style={styles.modalCloseBtn}
+                    >
+                      <Text style={styles.modalCloseText}>Fechar</Text>
+                    </Pressable>
+                  </View>
+
+                  <View style={styles.modalSection}>
+                    <View style={styles.nurseAvatar}>
+                      <Text style={styles.nurseAvatarText}>N</Text>
+                    </View>
+                    {nurseMode === "menu" ? (
+                      <View style={styles.nurseActions}>
+                        <Pressable onPress={() => setNurseMode("heal")} style={styles.nurseActionBtn}>
+                          <Text style={styles.nurseActionTitle}>Curar Pokemon</Text>
+                          <Text style={styles.nurseActionText}>Escolha ate 6 slots do time ativo.</Text>
+                        </Pressable>
+                        {currentBiomeGymEnabled || playerGym ? (
+                          <Pressable
+                            onPress={() => {
+                              setNurseModalVisible(false);
+                              router.push({ pathname: "/gym", params: { characterId: safeCharacterId, mode: playerGym ? "manage" : "register", biomeId: currentBiomeGymId || currentBiomeId } });
+                            }}
+                            style={styles.nurseActionBtn}
+                          >
+                            <Text style={styles.nurseActionTitle}>{playerGym ? "Gerenciar GYM" : "Registrar GYM"}</Text>
+                            <Text style={styles.nurseActionText}>
+                              {playerGym
+                                ? "Abrir gerenciamento do seu GYM."
+                                : "Abrir formulario de registro no bioma atual."}
+                            </Text>
+                          </Pressable>
+                        ) : (
+                          <View style={styles.nurseActionBtn}>
+                            <Text style={styles.nurseActionTitle}>GYM indisponivel</Text>
+                            <Text style={styles.nurseActionText}>Neste bioma a enfermeira apenas cura os Pokemon.</Text>
+                          </View>
+                        )}
+                      </View>
+                    ) : (
+                      <>
+                        <View style={styles.nurseSlotsGrid}>
+                          {team.map((mon, index) => {
+                            const slotIndex = index + 1;
+                            const disabled = Number(mon.speciesId || 0) <= 0;
+                            const active = nurseSelectedSlots.includes(slotIndex);
+                            return (
+                              <Pressable
+                                key={`nurse-slot-${slotIndex}`}
+                                onPress={() => !disabled && toggleNurseSlot(slotIndex)}
+                                style={[styles.nurseSlot, active ? styles.nurseSlotActive : null, disabled ? styles.nurseSlotDisabled : null]}
+                              >
+                                <Text style={styles.nurseSlotTitle}>Slot {slotIndex}</Text>
+                                <Text style={styles.nurseSlotName}>{disabled ? "Vazio" : mon.name}</Text>
+                                {!disabled ? (
+                                  <Text style={styles.nurseSlotMeta}>
+                                    HP {mon.hpCurrent}/{mon.hpTotal}
+                                  </Text>
+                                ) : null}
+                              </Pressable>
+                            );
+                          })}
+                        </View>
+                        <View style={styles.nurseFooter}>
+                          <Text style={styles.modalHint}>Custo total: {nurseSelectedSlots.length * 50} moedas.</Text>
+                          <View style={styles.nurseFooterActions}>
+                            <Pressable onPress={() => setNurseMode("menu")} style={styles.secondarySmallBtn}>
+                              <Text style={styles.secondarySmallBtnText}>Voltar</Text>
+                            </Pressable>
+                            <Pressable onPress={healSelectedTeamAtNurse} style={styles.primarySmallBtn}>
+                              <Text style={styles.primarySmallBtnText}>Confirmar cura</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                      </>
+                    )}
+                  </View>
+                </LinearGradient>
+              </View>
+            </View>
+          </Modal>
+
+          <Modal
+            visible={boxVisible}
+            animationType="slide"
+            onRequestClose={() => {
+              setBoxVisible(false);
+              if (gymMode) setGymMode(false);
+            }}
+          >
             <SafeAreaView style={styles.safe}>
               <LinearGradient colors={[COLORS.dark, "#111827"]} style={styles.bg}>
                 <Box
                   playerType={playerType}
-                  team={team}
-                  box={box}
-                  onClose={() => setBoxVisible(false)}
+                  title={gymMode ? "BOX DO GYM" : "BOX"}
+                  capacityLimitOverride={gymMode ? Math.max(1, Number(playerGym?.storageLimit || 1)) : undefined}
+                  teamPanelTitle={gymMode ? "TIME PRINCIPAL DO GYM" : "TIME (selecione um slot)"}
+                  primaryActionLabel={gymMode ? "Remover do time do GYM" : undefined}
+                  team={gymMode ? activeGymTeam : team}
+                  box={gymMode ? gymStorage : box}
+                  onClose={() => {
+                    setBoxVisible(false);
+                    if (gymMode) setGymMode(false);
+                  }}
                   onMoveTeamToBox={(teamSlotIndex) => {
-                    moveTeamToBox(teamSlotIndex).then((result) => {
+                    (gymMode ? removeGymMainTeamPokemon(teamSlotIndex) : moveTeamToBox(teamSlotIndex)).then((result) => {
                       if (!result.ok) Alert.alert("BOX", result.message);
                     });
                   }}
                   onSwapTeamWithBox={(teamSlotIndex, boxIndex) => {
-                    swapTeamWithBox(teamSlotIndex, boxIndex).then((result) => {
+                    (gymMode ? moveGymStorageToMainTeam(boxIndex, teamSlotIndex) : swapTeamWithBox(teamSlotIndex, boxIndex)).then((result) => {
                       if (!result.ok) Alert.alert("BOX", result.message);
                     });
                   }}
                   onMoveBoxToTeam={(boxIndex, teamSlotIndex) => {
-                    moveBoxToTeam(boxIndex, teamSlotIndex).then((result) => {
+                    (gymMode ? moveGymStorageToMainTeam(boxIndex, teamSlotIndex) : moveBoxToTeam(boxIndex, teamSlotIndex)).then((result) => {
                       if (!result.ok) Alert.alert("BOX", result.message);
+                    });
+                  }}
+                  extraTeamActionLabel={!gymMode && canSendSelectedTeamToGym ? "Enviar para BOX do GYM" : null}
+                  onExtraTeamAction={(teamSlotIndex) => {
+                    sendPlayerTeamPokemonToGymStorage(teamSlotIndex).then((result) => {
+                      if (!result.ok) Alert.alert("BOX", result.message);
+                      else Alert.alert("GYM", result.message);
                     });
                   }}
                 />
@@ -4191,11 +5738,17 @@ const styles = StyleSheet.create({
   characterNameRow: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
     gap: 8,
     marginBottom: 8,
   },
-  characterName: { color: COLORS.white, fontSize: 18, fontWeight: "900" },
+  headerActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginLeft: "auto",
+    flexShrink: 0,
+  },
+  characterName: { color: COLORS.white, fontSize: 18, fontWeight: "900", flex: 1, flexShrink: 1, maxWidth: "72%" },
   pcBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -4205,9 +5758,36 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255,255,255,0.08)",
     borderRadius: 999,
     paddingHorizontal: 10,
-    paddingVertical: 6,
+    paddingVertical: 8,
+    minWidth: 38,
+    justifyContent: "center",
+  },
+  pcBtnActive: {
+    borderColor: "rgba(16,185,129,0.45)",
+    backgroundColor: "rgba(16,185,129,0.18)",
   },
   pcBtnText: { color: COLORS.white, fontWeight: "900", fontSize: 11, letterSpacing: 0.4 },
+  gymFloatingButtonWrap: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    zIndex: 30,
+  },
+  gymFloatingButton: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(14,116,144,0.94)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.16)",
+    shadowColor: "#000",
+    shadowOpacity: 0.28,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 8,
+  },
   pillsRow: { flexDirection: "row", gap: 8 as any, marginBottom: 10, flexWrap: "wrap" },
   pill: {
     paddingVertical: 6,
@@ -4218,6 +5798,10 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.10)",
   },
   pillText: { color: COLORS.white, fontWeight: "800", fontSize: 12 },
+  gymPill: {
+    backgroundColor: "rgba(16,185,129,0.18)",
+    borderColor: "rgba(16,185,129,0.28)",
+  },
 
   metricsRow: {
     flexDirection: "row",
@@ -4474,6 +6058,68 @@ const styles = StyleSheet.create({
   },
   modalSectionTitle: { color: COLORS.white, fontWeight: "900", letterSpacing: 1, marginBottom: 10, fontSize: 12 },
   modalHint: { color: "rgba(255,255,255,0.72)", lineHeight: 18, fontWeight: "700", fontSize: 12 },
+  nurseAvatar: {
+    width: 72,
+    height: 72,
+    borderRadius: 20,
+    alignSelf: "center",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.14)",
+    marginBottom: 12,
+  },
+  nurseAvatarText: { color: COLORS.white, fontSize: 28, fontWeight: "900" },
+  nurseActions: { gap: 10 as any },
+  nurseActionBtn: {
+    borderRadius: 16,
+    padding: 14,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    gap: 4,
+  },
+  nurseActionTitle: { color: COLORS.white, fontWeight: "900", fontSize: 15 },
+  nurseActionText: { color: "rgba(255,255,255,0.72)", fontWeight: "700", lineHeight: 18 },
+  nurseSlotsGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 as any },
+  nurseSlot: {
+    width: "48%",
+    borderRadius: 16,
+    padding: 12,
+    backgroundColor: "rgba(0,0,0,0.22)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    gap: 4,
+  },
+  nurseSlotActive: {
+    backgroundColor: "rgba(59,130,246,0.20)",
+    borderColor: "rgba(59,130,246,0.55)",
+  },
+  nurseSlotDisabled: { opacity: 0.45 },
+  nurseSlotTitle: { color: "rgba(255,255,255,0.66)", fontWeight: "900", fontSize: 11 },
+  nurseSlotName: { color: COLORS.white, fontWeight: "900", fontSize: 14 },
+  nurseSlotMeta: { color: "rgba(255,255,255,0.72)", fontWeight: "700", fontSize: 12 },
+  nurseFooter: { marginTop: 12, gap: 10 },
+  nurseFooterActions: { flexDirection: "row", gap: 10 as any },
+  secondarySmallBtn: {
+    flex: 1,
+    borderRadius: 14,
+    paddingVertical: 12,
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+  },
+  secondarySmallBtnText: { color: COLORS.white, fontWeight: "900" },
+  primarySmallBtn: {
+    flex: 1,
+    borderRadius: 14,
+    paddingVertical: 12,
+    alignItems: "center",
+    backgroundColor: COLORS.primary,
+  },
+  primarySmallBtnText: { color: COLORS.white, fontWeight: "900" },
 
   statsGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 as any },
   statPill: {

@@ -120,6 +120,18 @@ function mapCharacterDoc(
   };
 }
 
+export function isValidCharacterDocData(data: DocumentData | undefined | null) {
+  if (!data) return false;
+  const name = String(data.name ?? "").trim();
+  const region = String(data.region ?? "").trim();
+  const classType = String(data.classType ?? "").trim();
+  const starter = data.starterPokemon ?? null;
+  const starterSpeciesName = String(starter?.speciesName ?? "").trim();
+  const starterSpeciesId = Number(starter?.speciesId ?? 0);
+
+  return !!name && !!region && !!classType && !!starterSpeciesName && starterSpeciesId > 0;
+}
+
 /**
  * =========================================================
  *  API
@@ -140,7 +152,7 @@ export function listenPlayerCharacters(
   return onSnapshot(
     q,
     (snapshot) => {
-      const chars = snapshot.docs.map(mapCharacterDoc);
+      const chars = snapshot.docs.filter((docSnap) => isValidCharacterDocData(docSnap.data())).map(mapCharacterDoc);
       onData(chars);
     },
     (err) => {

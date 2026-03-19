@@ -30,6 +30,7 @@ import {
   getTutorMovesForSpecies,
   type RelearnSource,
 } from "./logic/move-learning.service";
+import { resolveEvolutionTarget } from "./logic/evolution.service";
 
 // Catalogo local (leve): moves.json
 import movesDex from "../../data/pokemon/moves.json";
@@ -200,12 +201,8 @@ function getItemInfo(itemId?: string | null): { title: string; description: stri
 
 
 function canEvolveFallback(speciesId: number, level: number): { can: boolean; toId?: number } {
-  if (speciesId === 10 && level >= 7) return { can: true, toId: 11 };
-  if (speciesId === 11 && level >= 10) return { can: true, toId: 12 };
-  // Fallback minimo e seguro (nao inventa catalogo completo)
-  if (speciesId === 443 && level >= 24) return { can: true, toId: 444 };
-  if (speciesId === 444 && level >= 48) return { can: true, toId: 445 };
-  return { can: false };
+  const toId = resolveEvolutionTarget({ speciesId, level });
+  return toId ? { can: true, toId } : { can: false };
 }
 
 function countNonEmpty(team: TeamPokemonUI[]) {

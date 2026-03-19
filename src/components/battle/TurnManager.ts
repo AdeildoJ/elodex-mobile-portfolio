@@ -1,9 +1,10 @@
 import { computeDamage } from "./DamageCalculator";
 import { ptBR } from "../../battle/i18n/ptBR";
-import { canSkipCharge, fallbackStatusFromMove, isProtectMove, isTwoTurnMove, multiHitCountForMove, weatherFromMove } from "./moveRules";
+import { canHitSemiInvulnerableTarget, fallbackStatusFromMove } from "./moveRules";
 import type {
   BattleAction,
   BattleFieldState,
+  BattleMoveEffect,
   BattleMonster,
   BattleMove,
   BattleResolution,
@@ -69,6 +70,7 @@ function cloneTeam(team: BattleTeam) {
     protectMoveId: (m.protectMoveId ? String(m.protectMoveId) : null) as string | null,
     protectStreak: Math.max(0, n(m.protectStreak ?? 0)),
     chargingMoveId: m.chargingMoveId ? String(m.chargingMoveId) : null,
+    volatileStatuses: Array.isArray(m.volatileStatuses) ? m.volatileStatuses.map((status) => ({ ...status })) : [],
   }));
 }
 
@@ -88,6 +90,18 @@ function ensureHasMoves(mon: BattleMonster) {
       critStage: 0,
     },
   ];
+}
+
+function resolveCommittedMove(mon: BattleMonster, requestedIndex: number) {
+  const chargedId = String(mon.chargingMoveId || "").trim().toLowerCase();
+  if (chargedId) {
+    const chargedIndex = mon.moves.findIndex((mv) => String(mv.id || "").trim().toLowerCase() === chargedId && mv.pp > 0);
+    if (chargedIndex >= 0) {
+      return { move: mon.moves[chargedIndex], moveIndex: chargedIndex, lockedByCharge: true };
+    }
+  }
+  const safeIndex = requestedIndex >= 0 && requestedIndex < mon.moves.length ? requestedIndex : 0;
+  return { move: mon.moves[safeIndex] || mon.moves[0], moveIndex: safeIndex, lockedByCharge: false };
 }
 
 function speedOrder(playerMove: BattleMove, enemyMove: BattleMove, player: BattleMonster, enemy: BattleMonster): BattleSide[] {
@@ -181,6 +195,85 @@ function flinchChanceFromMove(move: BattleMove) {
   return 0;
 }
 
+function getMoveEffects(move: BattleMove, kind?: BattleMoveEffect["kind"]) {
+  const effects = Array.isArray(move.effects) ? move.effects : [];
+  return kind ? effects.filter((effect) => effect.kind === kind) : effects;
+}
+
+function getChargeExecution(move: BattleMove) {
+  const chargeTurns = n(move.execution?.chargeTurns);
+  if (chargeTurns <= 1) return null;
+  return move.execution ?? null;
+}
+
+function shouldSkipCharge(move: BattleMove, weather: BattleWeather) {
+  const allowed = Array.isArray(move.execution?.skipChargeInWeather) ? move.execution?.skipChargeInWeather : [];
+  return allowed.includes(weather);
+}
+
+function getMultiHitCount(move: BattleMove) {
+  const minHits = n(move.execution?.multiHit?.minHits);
+  const maxHits = n(move.execution?.multiHit?.maxHits);
+  if (minHits > 0 && maxHits >= minHits) {
+    return minHits === maxHits ? minHits : randomBetween(minHits, maxHits);
+  }
+  return 1;
+}
+
+function isSemiInvulnerableMove(move: BattleMove | null | undefined) {
+  return !!move?.execution?.semiInvulnerablePhase;
+}
+
+function statusFromEffectStatus(status: string | null | undefined): BattleMonster["status"] | null {
+  const value = String(status || "").trim().toLowerCase();
+  if (!value) return null;
+  if (value === "paralysis") return "paralyze";
+  if (value === "burn" || value === "poison" || value === "bad-poison" || value === "sleep" || value === "freeze") return value;
+  return null;
+}
+
+function findVolatile(mon: BattleMonster, id: string) {
+  const key = String(id || "").trim().toLowerCase();
+  return (mon.volatileStatuses || []).find((status) => String(status.id || "").trim().toLowerCase() === key) ?? null;
+}
+
+function setVolatile(mon: BattleMonster, id: string, turns?: number, sourceMoveId?: string) {
+  const key = String(id || "").trim().toLowerCase();
+  mon.volatileStatuses = Array.isArray(mon.volatileStatuses) ? mon.volatileStatuses.filter((status) => String(status.id || "").trim().toLowerCase() !== key) : [];
+  mon.volatileStatuses.push({ id: key, turns, sourceMoveId: sourceMoveId || null });
+}
+
+function clearVolatile(mon: BattleMonster, id: string) {
+  const key = String(id || "").trim().toLowerCase();
+  mon.volatileStatuses = Array.isArray(mon.volatileStatuses) ? mon.volatileStatuses.filter((status) => String(status.id || "").trim().toLowerCase() !== key) : [];
+}
+
+function applyVolatileStatus(events: BattleTurnEvent[], move: BattleMove, target: BattleMonster, status: string) {
+  const id = String(status || "").trim().toLowerCase();
+  if (!id) return false;
+  if (id === "trap") {
+    setVolatile(target, id, randomBetween(2, 5), move.id);
+    events.push({ type: "message", text: `${target.name} ficou preso!` });
+    return true;
+  }
+  if (id === "yawn") {
+    setVolatile(target, id, 2, move.id);
+    events.push({ type: "message", text: `${target.name} ficou sonolento!` });
+    return true;
+  }
+  if (id === "confusion") {
+    setVolatile(target, id, randomBetween(2, 5), move.id);
+    events.push({ type: "message", text: `${target.name} ficou confuso!` });
+    return true;
+  }
+  if (id === "infatuation") {
+    setVolatile(target, id, undefined, move.id);
+    events.push({ type: "message", text: `${target.name} ficou apaixonado!` });
+    return true;
+  }
+  return false;
+}
+
 function getReflectTurns(fieldState: BattleFieldState, side: BattleSide) {
   return side === "player" ? n(fieldState.playerReflectTurns) : n(fieldState.enemyReflectTurns);
 }
@@ -259,6 +352,7 @@ function applyStageDelta(mon: BattleMonster, stat: string, delta: number): boole
 
 function applyStatusWithMessage(
   events: BattleTurnEvent[],
+  side: BattleSide,
   moveId: string,
   target: BattleMonster,
   status: NonNullable<BattleMonster["status"]>
@@ -267,6 +361,7 @@ function applyStatusWithMessage(
   target.status = status;
   target.badPoisonCounter = status === "bad-poison" ? 1 : 0;
   if (status === "sleep") target.statusTurns = randomBetween(1, 2);
+  events.push({ type: "status", side, status });
   if (status === "burn") events.push({ type: "message", text: ptBR.ficouQueimado(target.name) });
   if (status === "poison" || status === "bad-poison") events.push({ type: "message", text: ptBR.ficouEnvenenado(target.name) });
   if (status === "paralyze") events.push({ type: "message", text: ptBR.ficouParalisado(target.name) });
@@ -297,10 +392,13 @@ export function resolveTurn(args: {
   playerAction: BattleAction;
   enemyAction: BattleAction;
   canRun: boolean;
+  isForcedPlayerSwitch?: boolean;
   typeMultiplier: (moveType: string, defenderSpeciesId: number) => number;
   fieldState?: BattleFieldState;
 }): BattleResolution {
   const events: BattleTurnEvent[] = [];
+  let playerAction = args.playerAction;
+  let playerActionBlocked = false;
   const playerTeam = cloneTeam(args.playerTeam);
   const enemyTeam = cloneTeam(args.enemyTeam);
   playerTeam.forEach((m) => {
@@ -362,7 +460,10 @@ export function resolveTurn(args: {
   }
 
   if (args.playerAction.type === "run") {
-    if (args.canRun) {
+    if (findVolatile(activePlayer, "trap")) {
+      events.push({ type: "message", text: `${activePlayer.name} nao conseguiu fugir!` });
+      playerActionBlocked = true;
+    } else if (args.canRun) {
       events.push({ type: "message", text: ptBR.fugiu() });
       return { events, playerTeam, enemyTeam, playerActive, enemyActive, fieldState, result: "ran" };
     }
@@ -370,15 +471,23 @@ export function resolveTurn(args: {
   }
 
   if (args.playerAction.type === "switch") {
-    const next = playerTeam[args.playerAction.targetIndex];
-    if (next && next.hpCurrent > 0 && args.playerAction.targetIndex !== playerActive) {
-      const oldName = playerTeam[playerActive].name;
-      const oldMon = playerTeam[playerActive];
-      if (oldMon && oldMon.status === "bad-poison") oldMon.badPoisonCounter = 0;
-      playerActive = args.playerAction.targetIndex;
-      events.push({ type: "switch", side: "player", text: ptBR.voltou(oldName) });
-      events.push({ type: "switch", side: "player", text: ptBR.vai(playerTeam[playerActive].name) });
-      applyEntryHazards("player", playerTeam[playerActive]);
+    if (findVolatile(playerTeam[playerActive], "trap")) {
+      events.push({ type: "message", text: `${playerTeam[playerActive].name} esta preso e nao pode trocar!` });
+      playerActionBlocked = true;
+    } else {
+      const next = playerTeam[args.playerAction.targetIndex];
+      if (next && next.hpCurrent > 0 && args.playerAction.targetIndex !== playerActive) {
+        const oldName = playerTeam[playerActive].name;
+        const oldMon = playerTeam[playerActive];
+        if (oldMon && oldMon.status === "bad-poison") oldMon.badPoisonCounter = 0;
+        playerActive = args.playerAction.targetIndex;
+        events.push({ type: "switch", side: "player", text: ptBR.voltou(oldName) });
+        events.push({ type: "switch", side: "player", text: ptBR.vai(playerTeam[playerActive].name), activeIndex: playerActive });
+        applyEntryHazards("player", playerTeam[playerActive]);
+        if (args.isForcedPlayerSwitch) {
+          return { events, playerTeam, enemyTeam, playerActive, enemyActive, fieldState, result: "ongoing" };
+        }
+      }
     }
   }
 
@@ -388,8 +497,7 @@ export function resolveTurn(args: {
     return { events, playerTeam, enemyTeam, playerActive, enemyActive, fieldState, result: "ongoing" };
   }
 
-  const playerMoveIndex = args.playerAction.type === "fight" ? args.playerAction.moveIndex : 0;
-  const playerMove = playerNow.moves[playerMoveIndex] || playerNow.moves[0];
+  const requestedPlayerMoveIndex = playerAction.type === "fight" ? playerAction.moveIndex : 0;
   const enemyMoveIndexPool = enemyNow.moves.map((mv, idx) => ({ idx, pp: mv.pp })).filter((mv) => mv.pp > 0);
   const enemyDamageMovePool = enemyMoveIndexPool.filter((x) => {
     const mv = enemyNow.moves[x.idx];
@@ -404,7 +512,11 @@ export function resolveTurn(args: {
     : enemyMoveIndexPool.length
     ? enemyMoveIndexPool[randomBetween(0, enemyMoveIndexPool.length - 1)].idx
     : 0;
-  const enemyMove = enemyNow.moves[enemyMoveIndex] || enemyNow.moves[0];
+  const committedPlayer = resolveCommittedMove(playerNow, requestedPlayerMoveIndex);
+  const committedEnemy = resolveCommittedMove(enemyNow, enemyMoveIndex);
+  const playerMoveIndex = committedPlayer.moveIndex;
+  const playerMove = committedPlayer.move;
+  const enemyMove = committedEnemy.move;
 
   if (!playerMove || !enemyMove) {
     return { events, playerTeam, enemyTeam, playerActive, enemyActive, fieldState, result: "ongoing" };
@@ -450,12 +562,14 @@ export function resolveTurn(args: {
         if (attacker.statusTurns <= 0) {
           attacker.status = "none";
           attacker.badPoisonCounter = 0;
+          events.push({ type: "status", side, status: "none" });
           events.push({ type: "message", text: ptBR.acordou(attacker.name) });
         }
         return;
       }
       attacker.status = "none";
       attacker.badPoisonCounter = 0;
+      events.push({ type: "status", side, status: "none" });
       events.push({ type: "message", text: ptBR.acordou(attacker.name) });
     }
 
@@ -463,6 +577,7 @@ export function resolveTurn(args: {
       if (Math.random() < 0.2 || move.type === "fire") {
         attacker.status = "none";
         attacker.badPoisonCounter = 0;
+        events.push({ type: "status", side, status: "none" });
         events.push({ type: "message", text: ptBR.descongelou(attacker.name) });
       } else {
         events.push({ type: "message", text: ptBR.estaCongelado(attacker.name) });
@@ -475,61 +590,114 @@ export function resolveTurn(args: {
       return;
     }
 
-    const protectLike = isProtectMove(move.id);
+    const confusion = findVolatile(attacker, "confusion");
+    if (confusion) {
+      events.push({ type: "message", text: `${attacker.name} esta confuso!` });
+      const turnsLeft = Math.max(0, n(confusion.turns ?? 0) - 1);
+      if (Math.random() < 1 / 3) {
+        const chip = Math.max(1, Math.floor(attacker.hpTotal / 8));
+        attacker.hpCurrent = Math.max(0, attacker.hpCurrent - chip);
+        events.push({ type: "message", text: `${attacker.name} se machucou na confusao!` });
+        events.push({ type: "hp", side, hpCurrent: attacker.hpCurrent, hpTotal: attacker.hpTotal });
+        if (turnsLeft <= 0) clearVolatile(attacker, "confusion");
+        else setVolatile(attacker, "confusion", turnsLeft, confusion.sourceMoveId || undefined);
+        if (attacker.hpCurrent <= 0) events.push({ type: "faint", side, text: ptBR.desmaiou(attacker.name) });
+        return;
+      }
+      if (turnsLeft <= 0) {
+        clearVolatile(attacker, "confusion");
+        events.push({ type: "message", text: `${attacker.name} saiu da confusao!` });
+      } else {
+        setVolatile(attacker, "confusion", turnsLeft, confusion.sourceMoveId || undefined);
+      }
+    }
+
+    if (findVolatile(attacker, "infatuation") && Math.random() < 0.5) {
+      events.push({ type: "message", text: `${attacker.name} esta apaixonado demais para atacar!` });
+      return;
+    }
+
+    const protectEffect = getMoveEffects(move, "protect")[0];
+    const protectLike = !!protectEffect;
 
     const chargingNow = attacker.chargingMoveId && String(attacker.chargingMoveId).toLowerCase() === String(move.id || "").toLowerCase();
     if (!chargingNow && !protectLike) attacker.protectStreak = 0;
 
-    const needsCharge = isTwoTurnMove(move.id) && !canSkipCharge(move.id, fieldState.weather);
+    const chargeExecution = getChargeExecution(move);
+    const needsCharge = !!chargeExecution && !shouldSkipCharge(move, fieldState.weather);
     if (!chargingNow && needsCharge) {
       move.pp = Math.max(0, move.pp - 1);
       attacker.chargingMoveId = String(move.id || "").toLowerCase();
-      events.push({ type: "attack", side, text: ptBR.usouGolpe(attacker.name, prettyMove(move.name || move.id)) });
+      events.push({
+        type: "attack",
+        side,
+        text: ptBR.usouGolpe(attacker.name, prettyMove(move.name || move.id)),
+        moveId: move.id,
+        moveStage: "charge",
+        semiInvulnerablePhase: move.execution?.semiInvulnerablePhase || null,
+      });
       events.push({ type: "message", text: ptBR.carregandoGolpe(attacker.name) });
       return;
     }
     attacker.chargingMoveId = null;
 
     move.pp = Math.max(0, move.pp - 1);
-    events.push({ type: "attack", side, text: ptBR.usouGolpe(attacker.name, prettyMove(move.name || move.id)) });
-    const nextWeather = weatherFromMove(move.id);
-    if (nextWeather) {
-      fieldState.weather = nextWeather;
-      fieldState.weatherTurns = 5;
-      events.push({ type: "weather", text: weatherStartText(nextWeather), weather: nextWeather, weatherTurns: fieldState.weatherTurns });
+    events.push({
+      type: "attack",
+      side,
+      text: ptBR.usouGolpe(attacker.name, prettyMove(move.name || move.id)),
+      moveId: move.id,
+      moveStage: chargingNow ? "execute" : undefined,
+      semiInvulnerablePhase: chargingNow ? move.execution?.semiInvulnerablePhase || null : null,
+    });
+    const weatherEffect = getMoveEffects(move, "weather")[0];
+    if (weatherEffect?.kind === "weather") {
+      fieldState.weather = weatherEffect.weather;
+      fieldState.weatherTurns = Math.max(1, n(weatherEffect.turns));
+      events.push({
+        type: "weather",
+        text: weatherStartText(weatherEffect.weather),
+        weather: weatherEffect.weather,
+        weatherTurns: fieldState.weatherTurns,
+      });
       return;
     }
 
-    const moveIdNorm = String(move.id || "").trim().toLowerCase();
-    if (moveIdNorm === "reflect") {
-      setReflectTurns(fieldState, side, 5);
-      events.push({ type: "message", text: ptBR.criouReflect(attacker.name) });
-      return;
-    }
-    if (moveIdNorm === "light-screen") {
-      setLightScreenTurns(fieldState, side, 5);
-      events.push({ type: "message", text: ptBR.criouLightScreen(attacker.name) });
-      return;
-    }
-    if (moveIdNorm === "spikes") {
-      const targetSide: BattleSide = isPlayer ? "enemy" : "player";
-      const before = targetSide === "player" ? n(fieldState.playerSpikesLayers) : n(fieldState.enemySpikesLayers);
-      addSpikesLayer(fieldState, targetSide);
-      const after = targetSide === "player" ? n(fieldState.playerSpikesLayers) : n(fieldState.enemySpikesLayers);
-      if (after > before) events.push({ type: "message", text: ptBR.spikesEspalhados() });
-      else events.push({ type: "message", text: ptBR.spikesCheio() });
-      return;
-    }
-    if (moveIdNorm === "stealth-rock") {
-      const targetSide: BattleSide = isPlayer ? "enemy" : "player";
-      const already = targetSide === "player" ? !!fieldState.playerStealthRock : !!fieldState.enemyStealthRock;
-      if (!already) {
-        setStealthRock(fieldState, targetSide, true);
-        events.push({ type: "message", text: ptBR.stealthRockAtivo() });
-      } else {
-        events.push({ type: "message", text: ptBR.stealthRockJaAtivo() });
+    const sideConditionEffects = getMoveEffects(move, "sideCondition");
+    if (sideConditionEffects.length > 0) {
+      for (const effect of sideConditionEffects) {
+        if (effect.kind !== "sideCondition") continue;
+        const targetSide: BattleSide =
+          effect.target === "user-side" ? side : isPlayer ? "enemy" : "player";
+        if (effect.condition === "reflect") {
+          setReflectTurns(fieldState, targetSide, Math.max(1, n(effect.turns)));
+          events.push({ type: "message", text: ptBR.criouReflect(attacker.name) });
+          return;
+        }
+        if (effect.condition === "light-screen") {
+          setLightScreenTurns(fieldState, targetSide, Math.max(1, n(effect.turns)));
+          events.push({ type: "message", text: ptBR.criouLightScreen(attacker.name) });
+          return;
+        }
+        if (effect.condition === "spikes") {
+          const before = targetSide === "player" ? n(fieldState.playerSpikesLayers) : n(fieldState.enemySpikesLayers);
+          addSpikesLayer(fieldState, targetSide);
+          const after = targetSide === "player" ? n(fieldState.playerSpikesLayers) : n(fieldState.enemySpikesLayers);
+          if (after > before) events.push({ type: "message", text: ptBR.spikesEspalhados() });
+          else events.push({ type: "message", text: ptBR.spikesCheio() });
+          return;
+        }
+        if (effect.condition === "stealth-rock") {
+          const already = targetSide === "player" ? !!fieldState.playerStealthRock : !!fieldState.enemyStealthRock;
+          if (!already) {
+            setStealthRock(fieldState, targetSide, true);
+            events.push({ type: "message", text: ptBR.stealthRockAtivo() });
+          } else {
+            events.push({ type: "message", text: ptBR.stealthRockJaAtivo() });
+          }
+          return;
+        }
       }
-      return;
     }
 
     if (protectLike) {
@@ -541,9 +709,20 @@ export function resolveTurn(args: {
         return;
       }
       attacker.protected = true;
-      attacker.protectMoveId = String(move.id || "").trim().toLowerCase();
+      attacker.protectMoveId = protectEffect.kind === "protect" ? protectEffect.protectType : String(move.id || "").trim().toLowerCase();
       attacker.protectStreak = streak + 1;
       events.push({ type: "message", text: ptBR.protegeu(attacker.name) });
+      return;
+    }
+
+    const defenderChargeId = String(defender.chargingMoveId || "").trim().toLowerCase();
+    const defenderChargeMove = defender.moves.find((mv) => String(mv.id || "").trim().toLowerCase() === defenderChargeId);
+    if (
+      defenderChargeId &&
+      isSemiInvulnerableMove(defenderChargeMove) &&
+      !canHitSemiInvulnerableTarget(move.id, defenderChargeId)
+    ) {
+      events.push({ type: "message", text: ptBR.falhou() });
       return;
     }
 
@@ -574,7 +753,7 @@ export function resolveTurn(args: {
         events.push({ type: "hp", side, hpCurrent: attacker.hpCurrent, hpTotal: attacker.hpTotal });
         if (attacker.hpCurrent <= 0) events.push({ type: "faint", side, text: ptBR.desmaiou(attacker.name) });
       } else if (isContact && protectMove === "baneful-bunker" && attacker.hpCurrent > 0) {
-        applyStatusWithMessage(events, "baneful-bunker", attacker, "poison");
+        applyStatusWithMessage(events, side, "baneful-bunker", attacker, "poison");
       } else if (isContact && protectMove === "kings-shield" && attacker.hpCurrent > 0) {
         applyStageDelta(attacker, "attack", -1);
         events.push({ type: "message", text: ptBR.kingsShieldDropAtk(attacker.name) });
@@ -587,9 +766,11 @@ export function resolveTurn(args: {
         events.push({ type: "message", text: ptBR.protegido() });
         return;
       }
-      const selfHeal = Math.max(0, n(move.healing));
-      if (selfHeal > 0) {
-        const heal = Math.max(1, Math.floor((attacker.hpTotal * selfHeal) / 100));
+      const healEffect = getMoveEffects(move, "heal").find(
+        (effect) => effect.kind === "heal" && effect.phase === "onUse" && effect.target === "user"
+      );
+      if (healEffect?.kind === "heal" && healEffect.percent > 0) {
+        const heal = Math.max(1, Math.floor((attacker.hpTotal * healEffect.percent) / 100));
         const before = attacker.hpCurrent;
         attacker.hpCurrent = Math.min(attacker.hpTotal, attacker.hpCurrent + heal);
         if (attacker.hpCurrent > before) {
@@ -603,16 +784,40 @@ export function resolveTurn(args: {
           return;
         }
       }
-      const directStatus = fallbackStatusFromMove(move.id) ?? statusFromAilment(move.statusAilment);
-      const statusTarget = (move.target || "").toLowerCase() === "user" ? attacker : defender;
-      if (directStatus && applyStatusWithMessage(events, move.id, statusTarget, directStatus)) {
+      const directStatusEffect = getMoveEffects(move, "status").find((effect) => effect.kind === "status" && effect.phase === "onUse");
+      const directStatus =
+        (directStatusEffect?.kind === "status" ? statusFromEffectStatus(directStatusEffect.status) : null) ??
+        fallbackStatusFromMove(move.id) ??
+        statusFromAilment(move.statusAilment);
+      const statusTarget =
+        directStatusEffect?.kind === "status" && directStatusEffect.target === "user"
+          ? attacker
+          : (move.target || "").toLowerCase() === "user"
+          ? attacker
+          : defender;
+      const statusSide: BattleSide =
+        statusTarget === attacker ? side : isPlayer ? "enemy" : "player";
+      if (directStatus && applyStatusWithMessage(events, statusSide, move.id, statusTarget, directStatus)) {
         return;
       }
-      const statChance = Math.max(0, Math.min(100, n(move.statChangeChance || 100)));
-      if ((move.statChanges?.length || 0) > 0 && Math.random() * 100 < statChance) {
+      const directVolatileEffect = getMoveEffects(move, "volatileStatus").find(
+        (effect) => effect.kind === "volatileStatus" && effect.phase === "onUse"
+      );
+      if (directVolatileEffect?.kind === "volatileStatus") {
+        const volatileTarget = directVolatileEffect.target === "user" ? attacker : defender;
+        if (applyVolatileStatus(events, move, volatileTarget, directVolatileEffect.status)) {
+          return;
+        }
+      }
+      const statStageEffect = getMoveEffects(move, "statStages").find((effect) => effect.kind === "statStages" && effect.phase === "onUse");
+      const statChance =
+        statStageEffect?.kind === "statStages" ? Math.max(0, Math.min(100, n(statStageEffect.chance || 100))) : Math.max(0, Math.min(100, n(move.statChangeChance || 100)));
+      const statusMoveChanges = statStageEffect?.kind === "statStages" ? statStageEffect.changes : move.statChanges || [];
+      if (statusMoveChanges.length > 0 && Math.random() * 100 < statChance) {
         let changed = false;
-        for (const sc of move.statChanges || []) {
-          const toSelf = (move.target || "").toLowerCase() === "user";
+        for (const sc of statusMoveChanges) {
+          const toSelf =
+            statStageEffect?.kind === "statStages" ? statStageEffect.target === "user" : (move.target || "").toLowerCase() === "user";
           const targetMon = toSelf ? attacker : defender;
           changed = applyStageDelta(targetMon, sc.stat, n(sc.stages)) || changed;
         }
@@ -639,7 +844,7 @@ export function resolveTurn(args: {
     const screenMult =
       move.category === "physical" && reflectTurns > 0 ? 0.5 : move.category === "special" && lightScreenTurns > 0 ? 0.5 : 1;
 
-    const plannedHits = multiHitCountForMove(move.id, randomBetween);
+    const plannedHits = getMultiHitCount(move);
     let hits = plannedHits;
     let totalDamage = 0;
     while (hits > 0 && defender.hpCurrent > 0) {
@@ -668,9 +873,10 @@ export function resolveTurn(args: {
     else if (damage.effectiveness < 1) events.push({ type: "message", text: ptBR.poucoEfetivo() });
     if (plannedHits > 1) events.push({ type: "message", text: ptBR.multiHit() });
 
-    const drainPct = n(move.drain);
-    if (drainPct > 0 && totalDamage > 0 && attacker.hpCurrent > 0) {
-      const heal = Math.max(1, Math.floor((totalDamage * drainPct) / 100));
+    const drainEffect = getMoveEffects(move, "drain")[0];
+    const recoilEffect = getMoveEffects(move, "recoil")[0];
+    if (drainEffect?.kind === "drain" && totalDamage > 0 && attacker.hpCurrent > 0) {
+      const heal = Math.max(1, Math.floor((totalDamage * drainEffect.percent) / 100));
       const before = attacker.hpCurrent;
       attacker.hpCurrent = Math.min(attacker.hpTotal, attacker.hpCurrent + heal);
       if (attacker.hpCurrent > before) {
@@ -682,8 +888,8 @@ export function resolveTurn(args: {
           hpTotal: attacker.hpTotal,
         });
       }
-    } else if (drainPct < 0 && totalDamage > 0 && attacker.hpCurrent > 0) {
-      const recoil = Math.max(1, Math.floor((totalDamage * Math.abs(drainPct)) / 100));
+    } else if (recoilEffect?.kind === "recoil" && totalDamage > 0 && attacker.hpCurrent > 0) {
+      const recoil = Math.max(1, Math.floor((totalDamage * recoilEffect.percent) / 100));
       attacker.hpCurrent = Math.max(0, attacker.hpCurrent - recoil);
       events.push({ type: "message", text: ptBR.sofreuRecoil(attacker.name) });
       events.push({
@@ -717,18 +923,43 @@ export function resolveTurn(args: {
       defender.flinched = true;
     }
 
-    const secStatusChance = Math.max(0, Math.min(100, n(move.statusChance || 0)));
-    const secStatus = statusFromAilment(move.statusAilment);
+    const secStatusEffect = getMoveEffects(move, "status").find((effect) => effect.kind === "status" && effect.phase === "onHit");
+    const secStatusChance =
+      secStatusEffect?.kind === "status" ? Math.max(0, Math.min(100, n(secStatusEffect.chance || 0))) : Math.max(0, Math.min(100, n(move.statusChance || 0)));
+    const secStatus =
+      (secStatusEffect?.kind === "status" ? statusFromEffectStatus(secStatusEffect.status) : null) ?? statusFromAilment(move.statusAilment);
     if (defender.hpCurrent > 0 && secStatus && secStatusChance > 0 && Math.random() * 100 < secStatusChance) {
-      const secTarget = (move.target || "").toLowerCase() === "user" ? attacker : defender;
-      applyStatusWithMessage(events, move.id, secTarget, secStatus);
+      const secTarget =
+        secStatusEffect?.kind === "status" && secStatusEffect.target === "user"
+          ? attacker
+          : (move.target || "").toLowerCase() === "user"
+          ? attacker
+          : defender;
+      const secStatusSide: BattleSide =
+        secTarget === attacker ? side : isPlayer ? "enemy" : "player";
+      applyStatusWithMessage(events, secStatusSide, move.id, secTarget, secStatus);
     }
 
-    const secStatChance = Math.max(0, Math.min(100, n(move.statChangeChance || 0)));
-    if (defender.hpCurrent > 0 && (move.statChanges?.length || 0) > 0 && Math.random() * 100 < secStatChance) {
+    const secVolatileEffect = getMoveEffects(move, "volatileStatus").find(
+      (effect) => effect.kind === "volatileStatus" && effect.phase === "onHit"
+    );
+    if (
+      defender.hpCurrent > 0 &&
+      secVolatileEffect?.kind === "volatileStatus" &&
+      Math.random() * 100 < Math.max(0, Math.min(100, n(secVolatileEffect.chance || 0)))
+    ) {
+      const volatileTarget = secVolatileEffect.target === "user" ? attacker : defender;
+      applyVolatileStatus(events, move, volatileTarget, secVolatileEffect.status);
+    }
+
+    const secStatEffect = getMoveEffects(move, "statStages").find((effect) => effect.kind === "statStages" && effect.phase === "onHit");
+    const secStatChance =
+      secStatEffect?.kind === "statStages" ? Math.max(0, Math.min(100, n(secStatEffect.chance || 0))) : Math.max(0, Math.min(100, n(move.statChangeChance || 0)));
+    const secChanges = secStatEffect?.kind === "statStages" ? secStatEffect.changes : move.statChanges || [];
+    if (defender.hpCurrent > 0 && secChanges.length > 0 && Math.random() * 100 < secStatChance) {
       let changed = false;
-      for (const sc of move.statChanges || []) {
-        const toSelf = (move.target || "").toLowerCase() === "user";
+      for (const sc of secChanges) {
+        const toSelf = secStatEffect?.kind === "statStages" ? secStatEffect.target === "user" : (move.target || "").toLowerCase() === "user";
         const targetMon = toSelf ? attacker : defender;
         changed = applyStageDelta(targetMon, sc.stat, n(sc.stages)) || changed;
       }
@@ -740,11 +971,15 @@ export function resolveTurn(args: {
     }
   };
 
-  if (args.playerAction.type === "switch") {
+  if (playerActionBlocked) {
     const p = playerTeam[playerActive];
     const e = enemyTeam[enemyActive];
     if (p && e && p.hpCurrent > 0 && e.hpCurrent > 0) runAttack("enemy", false);
-  } else if (args.playerAction.type === "run" && !args.canRun) {
+  } else if (playerAction.type === "switch") {
+    const p = playerTeam[playerActive];
+    const e = enemyTeam[enemyActive];
+    if (p && e && p.hpCurrent > 0 && e.hpCurrent > 0) runAttack("enemy", false);
+  } else if (playerAction.type === "run" && !args.canRun) {
     const p = playerTeam[playerActive];
     const e = enemyTeam[enemyActive];
     if (p && e && p.hpCurrent > 0 && e.hpCurrent > 0) runAttack("enemy", false);
@@ -758,9 +993,15 @@ export function resolveTurn(args: {
       if (side === "player") {
         runAttack(side, !enemyActed);
         playerActed = true;
+        const nextPlayer = playerTeam[playerActive];
+        const nextEnemy = enemyTeam[enemyActive];
+        if (!nextPlayer || !nextEnemy || nextPlayer.hpCurrent <= 0 || nextEnemy.hpCurrent <= 0) break;
       } else {
         runAttack(side, !playerActed);
         enemyActed = true;
+        const nextPlayer = playerTeam[playerActive];
+        const nextEnemy = enemyTeam[enemyActive];
+        if (!nextPlayer || !nextEnemy || nextPlayer.hpCurrent <= 0 || nextEnemy.hpCurrent <= 0) break;
       }
     }
   }
@@ -771,7 +1012,7 @@ export function resolveTurn(args: {
     const nextEnemy = aliveIndex(enemyTeam);
     if (nextEnemy >= 0) {
       enemyActive = nextEnemy;
-      events.push({ type: "switch", side: "enemy", text: ptBR.entrou(enemyTeam[nextEnemy].name) });
+      events.push({ type: "switch", side: "enemy", text: ptBR.entrou(enemyTeam[nextEnemy].name), activeIndex: nextEnemy });
       applyEntryHazards("enemy", enemyTeam[nextEnemy]);
     }
   }
@@ -833,6 +1074,41 @@ export function resolveTurn(args: {
 
   applyStatusChip("player", playerTeam[playerActive]);
   applyStatusChip("enemy", enemyTeam[enemyActive]);
+
+  const applyVolatileEndTurn = (side: BattleSide, mon: BattleMonster | undefined) => {
+    if (!mon || mon.hpCurrent <= 0) return;
+
+    const yawn = findVolatile(mon, "yawn");
+    if (yawn) {
+      const turnsLeft = Math.max(0, n(yawn.turns ?? 0) - 1);
+      if (turnsLeft <= 0) {
+        clearVolatile(mon, "yawn");
+        if (mon.status === "none") {
+          mon.status = "sleep";
+          mon.statusTurns = randomBetween(1, 2);
+          events.push({ type: "status", side, status: "sleep" });
+          events.push({ type: "message", text: ptBR.adormeceu(mon.name) });
+        }
+      } else {
+        setVolatile(mon, "yawn", turnsLeft, yawn.sourceMoveId || undefined);
+      }
+    }
+
+    const trap = findVolatile(mon, "trap");
+    if (trap) {
+      const chip = Math.max(1, Math.floor(mon.hpTotal / 8));
+      mon.hpCurrent = Math.max(0, mon.hpCurrent - chip);
+      events.push({ type: "message", text: `${mon.name} sofreu dano por estar preso!` });
+      events.push({ type: "hp", side, hpCurrent: mon.hpCurrent, hpTotal: mon.hpTotal });
+      const turnsLeft = Math.max(0, n(trap.turns ?? 0) - 1);
+      if (turnsLeft <= 0 || mon.hpCurrent <= 0) clearVolatile(mon, "trap");
+      else setVolatile(mon, "trap", turnsLeft, trap.sourceMoveId || undefined);
+      if (mon.hpCurrent <= 0) events.push({ type: "faint", side, text: ptBR.desmaiou(mon.name) });
+    }
+  };
+
+  applyVolatileEndTurn("player", playerTeam[playerActive]);
+  applyVolatileEndTurn("enemy", enemyTeam[enemyActive]);
 
   const applyHeldItemEndTurn = (side: BattleSide, mon: BattleMonster | undefined) => {
     if (!mon || mon.hpCurrent <= 0) return;

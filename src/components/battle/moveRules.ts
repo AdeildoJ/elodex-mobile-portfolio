@@ -25,6 +25,15 @@ const TWO_TURN_MOVES = new Set([
   "geomancy",
 ]);
 
+const SEMI_INVULNERABLE_CHARGE_MOVES = new Set([
+  "fly",
+  "dig",
+  "dive",
+  "bounce",
+  "phantom-force",
+  "shadow-force",
+]);
+
 const MULTI_HIT_FIXED: Record<string, number> = {
   "double-kick": 2,
   twineedle: 2,
@@ -70,6 +79,27 @@ export function isTwoTurnMove(moveId: string) {
 export function canSkipCharge(moveId: string, weather: BattleWeather) {
   const id = idNorm(moveId);
   return (id === "solar-beam" || id === "solar-blade") && weather === "sun";
+}
+
+export function isSemiInvulnerableWhileCharging(moveId: string) {
+  return SEMI_INVULNERABLE_CHARGE_MOVES.has(idNorm(moveId));
+}
+
+export function canHitSemiInvulnerableTarget(moveId: string, targetChargeMoveId: string) {
+  const move = idNorm(moveId);
+  const target = idNorm(targetChargeMoveId);
+
+  if (target === "dig") {
+    return move === "earthquake" || move === "magnitude" || move === "fissure";
+  }
+  if (target === "fly" || target === "bounce") {
+    return move === "gust" || move === "twister" || move === "thunder" || move === "hurricane" || move === "sky-uppercut" || move === "smack-down" || move === "thousand-arrows";
+  }
+  if (target === "dive") {
+    return move === "surf" || move === "whirlpool";
+  }
+
+  return false;
 }
 
 export function fallbackStatusFromMove(moveId: string): BattleStatusCondition | null {

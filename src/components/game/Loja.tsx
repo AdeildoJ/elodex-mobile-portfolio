@@ -3,7 +3,6 @@ import {
   ActivityIndicator,
   Alert,
   Image,
-  Linking,
   Modal,
   Pressable,
   ScrollView,
@@ -12,20 +11,22 @@ import {
   View,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  query,
-  runTransaction,
-  serverTimestamp,
-  where,
-} from "firebase/firestore";
+import { router } from "expo-router";
+import Ionicons from "@expo/vector-icons/Ionicons";
+import { collection, doc, getDoc, getDocs, query, runTransaction, serverTimestamp, where } from "firebase/firestore";
 
 import { auth, db } from "../../services/firebase/firebaseConfig";
+import { getMonetizationProducts, type MonetizationProduct } from "../../services/firebase/monetization.service";
+import { isGymMainTeamSlotProduct as isGymMainTeamSlotProductRoute, resolveProductRoute } from "../../services/monetization/product-routing.service";
+import {
+  listenPlayerGymCustomizationUnlocks,
+  purchaseGymCustomizationWithEcoins,
+  type PlayerGymCustomizationUnlocks,
+} from "../../services/firebase/gym-customization.service";
 import { COLORS } from "../../theme/colors";
 import itemsDex from "../../data/items/items.json";
+import ShopPixModal from "./ShopPixModal";
+import ShopCheckoutModal from "./ShopCheckoutModal";
 
 type SellMode = "game" | "ecoin" | "both";
 type OnlineMethod = "PIX" | "CREDIT" | "DEBIT";
@@ -62,6 +63,7 @@ type ShopItem = {
   description: string;
   category: string;
   kind: "ITEM" | "POKEBALL";
+  imageUrl?: string | null;
   sellMode: SellMode;
   gamePrice: number | null;
   realPrice: number | null;
@@ -91,7 +93,55 @@ type PaymentOrder = {
   deliveredAt?: unknown;
 };
 
+type PixOrderSession = {
+  orderId: string;
+  itemName: string;
+  total: number;
+  qrCodeBase64?: string | null;
+  copiaECola?: string | null;
+  expiresAt?: string | null;
+};
+
+type CheckoutOrderSession = {
+  orderId: string;
+  itemName: string;
+  total: number;
+  checkoutUrl: string;
+  orderPath: string;
+};
+
+type MonetizedDeliveryInfo = {
+  destinationScope: "character" | "account";
+  destinationKind:
+    | "character_bag"
+    | "eggs"
+    | "biome_access"
+    | "account"
+    | "gym_ticket"
+    | "trainer_license"
+    | "battle_castle_ticket"
+    | "exclusive_event_ticket"
+    | "gym_global";
+  successMessage: string;
+  checkoutMessage: string;
+  confirmationHint: string;
+};
+
+type SelectedOffer =
+  | { kind: "shop"; item: ShopItem }
+  | { kind: "monetization"; product: MonetizationProduct };
+
+type GymCustomizationStoreItem = {
+  id: string;
+  kind: "npc" | "scenario";
+  name: string;
+  description: string;
+  imageUrl?: string | null;
+  price: number;
+};
+
 const PAYMENT_API_BASE_URL = (process.env.EXPO_PUBLIC_PAYMENT_API_BASE_URL || "").replace(/\/$/, "");
+const DEBUG_ECOIN_FLOW = true;
 
 const BALL_BONUS: Record<string, number> = {
   "poke-ball": 1,
@@ -127,6 +177,67 @@ function formatName(raw: string) {
 
 function getItemImageUrl(itemId: string) {
   return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/${itemId}.png`;
+}
+
+function isCharacterDeliveredProduct(product: Pick<MonetizationProduct, "type" | "benefits" | "configuration"> | unknown) {
+  const rawProduct = (product && typeof product === "object" ? product : null) as
+    | Pick<MonetizationProduct, "type" | "benefits" | "configuration">
+    | null;
+  const normalized = String(rawProduct?.type ?? product ?? "").trim().toLowerCase();
+  const productCode = String((rawProduct as { code?: string | null } | null)?.code || "").trim().toLowerCase();
+  const productId = String((rawProduct as { id?: string | null } | null)?.id || "").trim().toLowerCase();
+  const productName = String((rawProduct as { name?: string | null } | null)?.name || "").trim().toLowerCase();
+  const slotScope = String(
+    rawProduct?.benefits?.metadata?.slotScope ??
+      (rawProduct?.configuration && typeof rawProduct.configuration === "object"
+        ? (rawProduct.configuration as Record<string, unknown>).slotScope
+        : "")
+  )
+    .trim()
+    .toLowerCase();
+  const gymMainTeamSlots = Number(rawProduct?.benefits?.gymMainTeamSlots || 0);
+  const gymDefenseSlotsAdded = Number(rawProduct?.benefits?.gymDefenseSlotsAdded || 0);
+  const storeCategory = String(rawProduct?.benefits?.metadata?.storeCategory || "").trim().toLowerCase();
+  if (normalized === "slot" && slotScope === "gym") return true;
+  if (normalized === "gym_main_team_slot") return true;
+  if (productCode === "gym-main-team-slot" || productId === "gym-main-team-slot") return true;
+  if (productCode === "slot-de-defesa" || productId === "slot-de-defesa") return true;
+  if (
+    (gymMainTeamSlots > 0 || gymDefenseSlotsAdded > 0) &&
+    (
+      storeCategory === "gym" ||
+      normalized.includes("gym") ||
+      productCode.includes("gym-main-team-slot") ||
+      productId.includes("gym-main-team-slot") ||
+      productCode.includes("slot-de-defesa") ||
+      productId.includes("slot-de-defesa") ||
+      productName.includes("slot de defesa") ||
+      productName.includes("slot do time principal")
+    )
+  ) {
+    return true;
+  }
+  return ["incubator", "iv_reset", "biome_ticket", "mystery_egg", "egg"].includes(normalized);
+}
+
+function resolveMonetizedDeliveryInfo(product: Pick<MonetizationProduct, "id" | "code" | "name" | "type" | "benefits" | "configuration"> | unknown): MonetizedDeliveryInfo {
+  const route = resolveProductRoute(product as any);
+  return {
+    destinationScope: route.scope,
+    destinationKind: route.kind,
+    successMessage: route.message,
+    checkoutMessage: route.checkoutMessage,
+    confirmationHint: route.confirmationHint,
+  };
+}
+
+function isMobileSupportedMonetizedProduct(product: Pick<MonetizationProduct, "id" | "code" | "name" | "type" | "benefits" | "configuration"> | unknown) {
+  const route = resolveProductRoute(product as any);
+  return ["character_bag", "eggs", "biome_access", "gym_ticket", "trainer_license"].includes(route.kind);
+}
+
+function isGymMainTeamSlotProduct(product: Pick<MonetizationProduct, "id" | "code" | "type" | "benefits" | "configuration"> | unknown) {
+  return isGymMainTeamSlotProductRoute(product as any);
 }
 
 function resolveSellMode(raw: unknown): SellMode {
@@ -171,20 +282,74 @@ function toInventoryDoc(item: ShopItem, qty: number) {
   };
 }
 
+function resolveShopItemSuccessMessage(item: ShopItem | null | undefined, qty = 1) {
+  if (!item) return "Pagamento aprovado e compra aplicada com sucesso.";
+  if (item.grantType === "biome_access") {
+    return "Pagamento aprovado e acesso ao bioma liberado para este personagem.";
+  }
+  return `${Math.max(1, qty)}x ${item.name} enviado para a mochila do personagem.`;
+}
+
 export function Loja({ uid, characterId, currentCoins, onCoinsChanged, onInventoryChanged }: Props) {
+  // which section of the store is visible
+  const [section, setSection] = useState<"poke" | "elo">("poke");
+
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [shopItems, setShopItems] = useState<ShopItem[]>([]);
+  const [monetizedItems, setMonetizedItems] = useState<MonetizationProduct[]>([]);
+  const [gymCustomizationCatalog, setGymCustomizationCatalog] = useState<GymCustomizationStoreItem[]>([]);
+  const [gymCustomizationUnlocks, setGymCustomizationUnlocks] = useState<PlayerGymCustomizationUnlocks>({ npcIds: [], scenarioIds: [] });
   const [paymentOrders, setPaymentOrders] = useState<PaymentOrder[]>([]);
+  const [pixSession, setPixSession] = useState<PixOrderSession | null>(null);
+  const [checkoutSession, setCheckoutSession] = useState<CheckoutOrderSession | null>(null);
 
-  const [selectedItem, setSelectedItem] = useState<ShopItem | null>(null);
+  const [ecoinBalance, setEcoinBalance] = useState<number>(0);
+
+  const [selectedOffer, setSelectedOffer] = useState<SelectedOffer | null>(null);
   const [qty, setQty] = useState(1);
-  const [method, setMethod] = useState<"GAME" | OnlineMethod>("GAME");
+  const [method, setMethod] = useState<"GAME" | "ECOIN" | OnlineMethod>("GAME");
 
   const pendingOrders = useMemo(
     () => paymentOrders.filter((o) => o.status === "pending"),
     [paymentOrders]
   );
+
+  // filter items according to selected section
+  const visibleItems = useMemo(() => {
+    if (section === "elo") {
+      return monetizedItems
+         .filter((item) => item.status === "active" && item.storeVisible !== false && isMobileSupportedMonetizedProduct(item))
+        .map((item) => ({
+          id: item.id,
+          name: item.name,
+          description: item.description,
+          category: "monetized",
+          kind: "ITEM" as const,
+          imageUrl: item.imageUrl || null,
+          sellMode: "game" as const,
+          gamePrice: Math.max(0, n(item.price, 0)),
+          realPrice: null,
+          grantType: "inventory" as const,
+          paymentUrls: {},
+        }));
+    }
+    return shopItems.filter((it) => it.sellMode === "game" || it.sellMode === "both");
+  }, [section, monetizedItems, shopItems]);
+
+  const visibleMonetizedItems = useMemo(() => {
+    if (section !== "elo") return [];
+    return monetizedItems .filter((item) => item.status === "active" && item.storeVisible !== false && isMobileSupportedMonetizedProduct(item));
+  }, [monetizedItems, section]);
+  const visibleGymCustomizationItems = useMemo(() => {
+    if (section !== "elo") return [];
+    const unlockedNpcIds = new Set(gymCustomizationUnlocks.npcIds);
+    const unlockedScenarioIds = new Set(gymCustomizationUnlocks.scenarioIds);
+    return gymCustomizationCatalog.map((item) => ({
+      ...item,
+      unlocked: item.kind === "npc" ? unlockedNpcIds.has(item.id) : unlockedScenarioIds.has(item.id),
+    }));
+  }, [gymCustomizationCatalog, gymCustomizationUnlocks, section]);
 
   const canOpen = !!uid && !!characterId;
 
@@ -344,7 +509,12 @@ export function Loja({ uid, characterId, currentCoins, onCoinsChanged, onInvento
     if (!canOpen) return;
     setLoading(true);
     try {
-      const snap = await getDocs(query(collection(db, "itemsConfig"), where("saleEnabled", "==", true)));
+      const [snap, products, npcSnap, scenarioSnap] = await Promise.all([
+        getDocs(query(collection(db, "itemsConfig"), where("saleEnabled", "==", true))),
+        getMonetizationProducts(),
+        getDocs(collection(db, "npcs")),
+        getDocs(collection(db, "scenarios")),
+      ]);
       const rows: ShopItem[] = [];
 
       snap.forEach((d) => {
@@ -370,6 +540,7 @@ export function Loja({ uid, characterId, currentCoins, onCoinsChanged, onInvento
               : String(cat?.descriptionPtBr || cat?.effectPtBr || "Item disponivel para compra na loja."),
           category,
           kind,
+          imageUrl: null,
           sellMode,
           gamePrice,
           realPrice,
@@ -388,7 +559,46 @@ export function Loja({ uid, characterId, currentCoins, onCoinsChanged, onInvento
         if (a.kind !== b.kind) return a.kind === "POKEBALL" ? -1 : 1;
         return a.name.localeCompare(b.name, "pt-BR");
       });
+      const customizationRows: GymCustomizationStoreItem[] = [
+        ...npcSnap.docs
+          .map((docSnap) => {
+            const data = docSnap.data() as Record<string, unknown>;
+            if (!Boolean(data.isCommercialized)) return null;
+            const price = Math.max(0, n(data.ecoinPrice, 0));
+            if (price <= 0) return null;
+            return {
+              id: docSnap.id,
+              kind: "npc" as const,
+              name: String(data.nome || docSnap.id),
+              description: `NPC para uso em GYM.${String(data.role || "").trim() ? ` Funcao: ${String(data.role || "").trim()}.` : ""}`,
+              imageUrl: String(data.imageUrl || ""),
+              price,
+            };
+          })
+          .filter(Boolean) as GymCustomizationStoreItem[],
+        ...scenarioSnap.docs
+          .map((docSnap) => {
+            const data = docSnap.data() as Record<string, unknown>;
+            if (data.isActive === false || !Boolean(data.isCommercialized)) return null;
+            const price = Math.max(0, n(data.ecoinPrice, 0));
+            if (price <= 0) return null;
+            return {
+              id: docSnap.id,
+              kind: "scenario" as const,
+              name: String(data.name || docSnap.id),
+              description: "Cenario visual desbloqueavel para selecao manual no GYM.",
+              imageUrl: String(data.processedImageUrl || data.imageUrl || ""),
+              price,
+            };
+          })
+          .filter(Boolean) as GymCustomizationStoreItem[],
+      ].sort((a, b) => {
+        if (a.kind !== b.kind) return a.kind === "scenario" ? -1 : 1;
+        return a.name.localeCompare(b.name, "pt-BR");
+      });
       setShopItems(rows);
+      setMonetizedItems(products);
+      setGymCustomizationCatalog(customizationRows);
       await loadOrders();
     } finally {
       setLoading(false);
@@ -399,11 +609,96 @@ export function Loja({ uid, characterId, currentCoins, onCoinsChanged, onInvento
     loadShop();
   }, [loadShop]);
 
-  function openBuyModal(item: ShopItem) {
-    setSelectedItem(item);
+  useEffect(() => {
+    if (!DEBUG_ECOIN_FLOW) return;
+    console.log("[ECOIN_FLOW][store:context]", {
+      uid,
+      characterId,
+      canOpen,
+    });
+  }, [canOpen, characterId, uid]);
+
+  useEffect(() => {
+    if (!uid) {
+      setGymCustomizationUnlocks({ npcIds: [], scenarioIds: [] });
+      return;
+    }
+    return listenPlayerGymCustomizationUnlocks(uid, setGymCustomizationUnlocks);
+  }, [uid]);
+
+  // load profile to show ecoin balance
+  useEffect(() => {
+    async function loadProfile() {
+      if (!uid) return;
+      const docRef = doc(db, "players", uid);
+      const snap = await getDoc(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as Record<string, unknown>;
+      setEcoinBalance(Math.max(0, n(data.ecoinBalance, 0)));
+    }
+
+    if (canOpen) {
+      void loadProfile();
+    }
+  }, [canOpen, uid]);
+
+  useEffect(() => {
+    if (!canOpen || pendingOrders.length === 0) return;
+    const timer = setInterval(() => {
+      void loadOrders();
+    }, 3500);
+    return () => clearInterval(timer);
+  }, [canOpen, loadOrders, pendingOrders.length]);
+
+  useEffect(() => {
+    if (!pixSession) return;
+    const current = paymentOrders.find((order) => order.id === pixSession.orderId);
+    if (!current) return;
+    if (current.status === "approved") {
+      setPixSession(null);
+      const shopItem = shopItems.find((item) => item.id === current.itemId) || null;
+      Alert.alert("Pagamento aprovado", resolveShopItemSuccessMessage(shopItem, current.qty));
+      return;
+    }
+    if (current.status === "failed" || current.status === "canceled") {
+      setPixSession(null);
+      Alert.alert("Pagamento nao concluido", `Status atual: ${current.status}.`);
+    }
+  }, [paymentOrders, pixSession]);
+
+  useEffect(() => {
+    if (!checkoutSession) return;
+    const current = paymentOrders.find((order) => order.id === checkoutSession.orderId);
+    if (!current) return;
+    if (current.status === "approved") {
+      setCheckoutSession(null);
+      const shopItem = shopItems.find((item) => item.id === current.itemId) || null;
+      Alert.alert("Pagamento aprovado", resolveShopItemSuccessMessage(shopItem, current.qty));
+      return;
+    }
+    if (current.status === "failed" || current.status === "canceled") {
+      setCheckoutSession(null);
+      Alert.alert("Pagamento nao concluido", `Status atual: ${current.status}.`);
+    }
+  }, [checkoutSession, paymentOrders]);
+
+  function openShopItemModal(item: ShopItem) {
+    if (section === "elo") {
+      const product = monetizedItems.find((entry) => entry.id === item.id);
+      if (product) {
+        openMonetizedProductModal(product);
+        return;
+      }
+    }
+    setSelectedOffer({ kind: "shop", item });
     setQty(1);
-    if (item.sellMode === "game") setMethod("GAME");
-    else setMethod("PIX");
+    setMethod("GAME");
+  }
+
+  function openMonetizedProductModal(product: MonetizationProduct) {
+    setSelectedOffer({ kind: "monetization", product });
+    setQty(1);
+    setMethod("ECOIN");
   }
 
   async function purchaseWithCoins(item: ShopItem, purchaseQty: number) {
@@ -516,6 +811,222 @@ export function Loja({ uid, characterId, currentCoins, onCoinsChanged, onInvento
     await onInventoryChanged?.();
   }
 
+  async function purchaseMonetizedWithEcoins(product: MonetizationProduct, purchaseQty: number) {
+    const total = Math.max(0, n(product.price, 0)) * purchaseQty;
+    if (total <= 0) throw new Error("Preco em ECoins invalido.");
+    const deliveryInfo = resolveMonetizedDeliveryInfo(product);
+    const deliveryScope = deliveryInfo.destinationScope === "character" ? "character_backpack" : "account";
+    const consumedByCharacterId = deliveryInfo.destinationScope === "character" ? characterId : "";
+    if (deliveryInfo.destinationScope === "character" && !characterId) {
+      throw new Error("Personagem atual nao identificado para entrega do item.");
+    }
+
+    const playerRef = doc(db, "players", uid);
+    const historyRef = doc(collection(db, "players", uid, "monetizationHistory"));
+    const txRef = doc(collection(db, "players", uid, "characters", characterId, "transactions"));
+    const purchaseContext = "character_store";
+    const isGymSlot = isGymMainTeamSlotProduct(product);
+
+    let nextBalance = 0;
+    let createdEntitlementId = "";
+
+    if (DEBUG_ECOIN_FLOW) {
+      console.log("[ECOIN_FLOW][purchase:start]", {
+        uid,
+        characterId,
+        productId: product.id,
+        productCode: product.code || null,
+        productType: product.type,
+        purchaseContext,
+        deliveryScope,
+        consumedByCharacterId: consumedByCharacterId || null,
+        isGymSlot,
+        total,
+      });
+    }
+
+    await runTransaction(db, async (tx) => {
+      const entitlementRef = doc(collection(db, "players", uid, "productEntitlements"));
+      const itemRef = isGymSlot
+        ? doc(db, "players", uid, "characters", characterId, "itens", "gym-main-team-slot-token")
+        : null;
+      const itemMetaRef = isGymSlot
+        ? doc(db, "players", uid, "characters", characterId, "itens", "_meta")
+        : null;
+
+      const playerSnap = await tx.get(playerRef);
+      const [itemSnap, metaSnap] =
+        isGymSlot && itemRef && itemMetaRef
+          ? await Promise.all([tx.get(itemRef), tx.get(itemMetaRef)])
+          : [null, null];
+
+      const currentBalance = Math.max(0, n(playerSnap.data()?.ecoinBalance, 0));
+      if (currentBalance < total) throw new Error("Saldo insuficiente de ECoins.");
+      nextBalance = currentBalance - total;
+
+      let slotItemPayload: Record<string, unknown> | null = null;
+      createdEntitlementId = entitlementRef.id;
+
+      if (isGymSlot && itemRef && itemMetaRef) {
+        const amount = Math.max(
+          1,
+          Math.trunc(
+            Number(
+              product.benefits?.gymDefenseSlotsAdded ||
+                product.benefits?.gymMainTeamSlots ||
+                (product.benefits?.metadata?.slotsAdded as number | undefined) ||
+                1
+            )
+          )
+        );
+        const currentQty = Math.max(0, n(itemSnap?.data()?.quantity, 0));
+        const totalQuantity = Math.max(0, n(metaSnap?.data()?.totalQuantity, 0));
+        slotItemPayload = {
+          id: "gym-main-team-slot-token",
+          kind: "ITEM",
+          name: "Slot do time principal do GYM",
+          description: "Use na mochila do personagem para liberar um novo slot do time principal do GYM.",
+          quantity: currentQty + amount,
+          effectType: "ACTIVATE_GYM_MAIN_TEAM_SLOT",
+          metadata: {
+            source: "ecoin_character_store_purchase",
+            productId: product.id,
+            productCode: product.code || null,
+            purchaseContext,
+            deliveredCharacterId: characterId,
+          },
+          updatedAt: serverTimestamp(),
+        };
+        tx.set(itemRef, slotItemPayload, { merge: true });
+        tx.set(
+          itemMetaRef,
+          {
+            totalQuantity: totalQuantity + amount,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+
+      tx.set(
+        playerRef,
+        {
+          ecoinBalance: nextBalance,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      tx.set(txRef, {
+        type: "ecoin_product_purchase",
+        paymentType: "ECOIN",
+        itemId: product.id,
+        itemName: product.name,
+        quantity: purchaseQty,
+        unitPrice: Math.max(0, n(product.price, 0)),
+        totalPaid: total,
+        status: "approved",
+        consumedCurrency: "ECOIN",
+        purchaseContext,
+        consumedByCharacterId: consumedByCharacterId || null,
+        createdAt: serverTimestamp(),
+      });
+
+      tx.set(historyRef, {
+        type: "product_activation",
+        source: "system",
+        status: "active",
+        itemId: product.id,
+        itemType: "product",
+        itemName: product.name,
+        amountPaid: total,
+        currency: "ECOIN",
+        purchaseContext,
+        consumedByCharacterId: consumedByCharacterId || null,
+        ecoinAmount: total,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(
+        entitlementRef,
+        {
+          entitlementId: entitlementRef.id,
+          productId: product.id,
+          productCode: product.code || null,
+          productType: product.type,
+          productName: product.name,
+          benefits: product.benefits || null,
+          quantity: purchaseQty,
+          status: "active",
+          source: "system",
+          deliveryScope,
+          consumedCurrency: "ECOIN",
+          purchaseContext,
+          consumedByCharacterId: consumedByCharacterId || null,
+          claimedAt: isGymSlot ? serverTimestamp() : null,
+          claimedByCharacterId: isGymSlot ? characterId : null,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      if (DEBUG_ECOIN_FLOW) {
+        console.log("[ECOIN_FLOW][purchase:tx]", {
+          uid,
+          characterId,
+          productId: product.id,
+          productCode: product.code || null,
+          productType: product.type,
+          currentBalance,
+          nextBalance,
+          purchaseContext,
+          deliveryScope,
+          consumedByCharacterId: characterId,
+          entitlementId: entitlementRef.id,
+          entitlementPayload: {
+            productId: product.id,
+            productCode: product.code || null,
+            productType: product.type,
+            deliveryScope,
+            purchaseContext,
+            consumedByCharacterId: consumedByCharacterId || null,
+            claimedImmediately: isGymSlot,
+          },
+          slotItemPayload,
+        });
+      }
+    });
+
+    setEcoinBalance(nextBalance);
+    await onInventoryChanged?.();
+
+    if (DEBUG_ECOIN_FLOW) {
+      console.log("[ECOIN_FLOW][purchase:done]", {
+        uid,
+        characterId,
+        productId: product.id,
+        entitlementId: createdEntitlementId,
+        nextBalance,
+        directCharacterDelivery: isGymSlot,
+      });
+    }
+  }
+
+  async function purchaseGymCustomization(item: GymCustomizationStoreItem) {
+    await purchaseGymCustomizationWithEcoins({
+      uid,
+      characterId,
+      kind: item.kind,
+      itemId: item.id,
+      itemName: item.name,
+      price: item.price,
+      imageUrl: item.imageUrl,
+    });
+    setEcoinBalance((current) => Math.max(0, current - item.price));
+  }
+
 async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMethod: OnlineMethod) {
     if (!PAYMENT_API_BASE_URL) {
       throw new Error(
@@ -541,9 +1052,21 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
     });
 
     const raw = await res.text();
-    let data: { checkoutUrl?: string; error?: string; details?: unknown } = {};
+    let data: {
+      checkoutUrl?: string;
+      orderId?: string;
+      error?: string;
+      details?: unknown;
+      mode?: string;
+      qrCode_base64?: string;
+      qrCode?: string;
+      copiaECola?: string;
+      expiresAt?: string;
+    } = {};
     try {
-      data = raw ? (JSON.parse(raw) as { checkoutUrl?: string; error?: string; details?: unknown }) : {};
+      data = raw
+        ? (JSON.parse(raw) as { checkoutUrl?: string; orderId?: string; error?: string; details?: unknown })
+        : {};
     } catch {
       if (!res.ok) {
         throw new Error(`Falha ao iniciar pagamento (${res.status}). Resposta invalida do servidor.`);
@@ -551,18 +1074,43 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
     }
 
     if (!res.ok) {
+      const detailsText =
+        typeof data.details === "string"
+          ? data.details
+          : data.details && typeof data.details === "object"
+          ? JSON.stringify(data.details)
+          : "";
       const message =
         data.error ||
-        (typeof data.details === "string" ? data.details : "") ||
+        detailsText ||
         `Falha ao iniciar pagamento (${res.status}).`;
       throw new Error(message);
     }
+    const orderId = String(data.orderId || "");
+    const orderPath = `players/${uid}/characters/${characterId}/paymentOrders/${orderId}`;
+    if (String(data.mode || "").toLowerCase() === "pix") {
+      setPixSession({
+        orderId,
+        itemName: item.name,
+        total: Math.max(0, n(item.realPrice, 0)) * purchaseQty,
+        qrCodeBase64: String(data.qrCode_base64 || data.qrCode || "") || null,
+        copiaECola: String(data.copiaECola || "") || null,
+        expiresAt: String(data.expiresAt || "") || null,
+      });
+      await loadOrders();
+      return;
+    }
+
     const checkoutUrl = String(data.checkoutUrl || "");
     if (!checkoutUrl) throw new Error("Gateway nao retornou URL de checkout.");
 
-    const canOpenUrl = await Linking.canOpenURL(checkoutUrl);
-    if (!canOpenUrl) throw new Error("Nao foi possivel abrir o checkout no dispositivo.");
-    await Linking.openURL(checkoutUrl);
+    setCheckoutSession({
+      orderId,
+      itemName: item.name,
+      total: Math.max(0, n(item.realPrice, 0)) * purchaseQty,
+      checkoutUrl,
+      orderPath,
+    });
 
     await loadOrders();
     Alert.alert("Pedido criado", "Pagamento iniciado. Aguardando confirmacao do gateway.");
@@ -574,8 +1122,9 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
     if (!snap.exists()) return;
     const data = snap.data() as Record<string, unknown>;
     const status = String(data.status || "pending").toLowerCase();
+    const shopItem = shopItems.find((item) => item.id === String(data.itemId || "")) || null;
     if (status === "approved") {
-      Alert.alert("Pagamento aprovado", "Pedido aprovado pelo gateway.");
+      Alert.alert("Pagamento aprovado", resolveShopItemSuccessMessage(shopItem, Math.max(1, n(data.qty, 1))));
     } else if (status === "failed" || status === "canceled") {
       Alert.alert("Pagamento nao aprovado", `Status atual: ${status}`);
     } else {
@@ -585,25 +1134,23 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
   }
 
   async function onConfirmPurchase() {
-    if (!selectedItem) return;
+    if (!selectedOffer) return;
     const purchaseQty = Math.max(1, qty);
 
     try {
       setSubmitting(true);
 
-      if (method === "GAME") {
-        await purchaseWithCoins(selectedItem, purchaseQty);
-        Alert.alert(
-          "Compra concluida",
-          selectedItem.grantType === "biome_access"
-            ? `Acesso temporario ao bioma aplicado com sucesso.`
-            : `${purchaseQty}x ${selectedItem.name} adicionado na mochila.`
-        );
+      if (selectedOffer.kind === "shop" && method === "GAME") {
+        await purchaseWithCoins(selectedOffer.item, purchaseQty);
+        Alert.alert("Compra concluida", resolveShopItemSuccessMessage(selectedOffer.item, purchaseQty));
+      } else if (selectedOffer.kind === "shop") {
+        await createOnlineOrder(selectedOffer.item, purchaseQty, method as OnlineMethod);
       } else {
-        await createOnlineOrder(selectedItem, purchaseQty, method);
+        await purchaseMonetizedWithEcoins(selectedOffer.product, purchaseQty);
+        Alert.alert("Compra concluida", resolveMonetizedDeliveryInfo(selectedOffer.product).successMessage);
       }
 
-      setSelectedItem(null);
+      setSelectedOffer(null);
       setQty(1);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Falha ao processar compra.";
@@ -614,6 +1161,9 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
   }
 
   function renderPrice(item: ShopItem) {
+    if (section === "elo") {
+      return `${Math.max(0, n(item.gamePrice, 0))} ECoins`;
+    }
     if (item.sellMode === "game") {
       return `Moedas: ${Math.max(0, n(item.gamePrice, 0))}`;
     }
@@ -624,10 +1174,13 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
   }
 
   const selectedTotal = useMemo(() => {
-    if (!selectedItem) return 0;
-    if (method === "GAME") return Math.max(0, n(selectedItem.gamePrice, 0)) * Math.max(1, qty);
-    return Math.max(0, n(selectedItem.realPrice, 0)) * Math.max(1, qty);
-  }, [method, qty, selectedItem]);
+    if (!selectedOffer) return 0;
+    if (selectedOffer.kind === "monetization") {
+      return Math.max(0, n(selectedOffer.product.price, 0)) * Math.max(1, qty);
+    }
+    if (method === "GAME") return Math.max(0, n(selectedOffer.item.gamePrice, 0)) * Math.max(1, qty);
+    return Math.max(0, n(selectedOffer.item.realPrice, 0)) * Math.max(1, qty);
+  }, [method, qty, selectedOffer]);
 
   if (!canOpen) {
     return (
@@ -639,6 +1192,27 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
 
   return (
     <View style={styles.root}>
+      <ShopPixModal
+        visible={!!pixSession}
+        title={pixSession?.itemName || "Pagamento PIX"}
+        valueLabel={`R$ ${Math.max(0, pixSession?.total || 0).toFixed(2)}`}
+        qrBase64={pixSession?.qrCodeBase64}
+        copiaECola={pixSession?.copiaECola}
+        expiresAt={pixSession?.expiresAt}
+        onClose={() => setPixSession(null)}
+        onCheckStatus={() => {
+          if (!pixSession?.orderId) return;
+          void refreshOrderStatus(pixSession.orderId);
+        }}
+      />
+      <ShopCheckoutModal
+        visible={!!checkoutSession}
+        title={checkoutSession ? `Cartao • ${checkoutSession.itemName}` : "Pagamento com cartao"}
+        orderId={checkoutSession?.orderId}
+        checkoutUrl={checkoutSession?.checkoutUrl}
+        onClose={() => setCheckoutSession(null)}
+      />
+
       <LinearGradient
         colors={["rgba(34,197,94,0.25)", "rgba(59,130,246,0.10)"]}
         start={{ x: 0, y: 0 }}
@@ -646,9 +1220,25 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
         style={styles.header}
       >
         <Text style={styles.headerTitle}>Loja</Text>
-        <Text style={styles.headerSub}>Saldo atual: {Math.max(0, n(currentCoins, 0))} PokeCoins</Text>
-        <Text style={styles.headerHint}>Pagamentos online: PIX, credito e debito.</Text>
+        <Text style={styles.headerSub}>Saldo atual: {Math.max(0, n(currentCoins, 0))} PokeCoins{section === "elo" ? ` • ${ecoinBalance} ECoins` : ""}</Text>
+        <Text style={styles.headerHint}>{section === "elo" ? "EloMart consome saldo compartilhado da conta." : "Pagamentos online: PIX, credito e debito."}</Text>
       </LinearGradient>
+
+      {/* section tabs */}
+      <View style={styles.tabRow}>
+        <Pressable
+          style={[styles.tabBtn, section === "poke" && styles.tabBtnActive]}
+          onPress={() => setSection("poke")}
+        >
+          <Text style={styles.tabText}>PokeMart</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.tabBtn, section === "elo" && styles.tabBtnActive]}
+          onPress={() => setSection("elo")}
+        >
+          <Text style={styles.tabText}>EloMart</Text>
+        </Pressable>
+      </View>
 
       <View style={styles.pendingWrap}>
         <Text style={styles.pendingTitle}>Pedidos online pendentes: {pendingOrders.length}</Text>
@@ -674,17 +1264,40 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
           <ActivityIndicator color={COLORS.primary} />
           <Text style={styles.loadingText}>Carregando itens da loja...</Text>
         </View>
-      ) : shopItems.length === 0 ? (
+      ) : false ? (
+        <View style={{ gap: 10 }}>
+          <View style={styles.ecoinSectionCard}>
+            <Text style={styles.ecoinSectionTitle}>Comprar Ecoins</Text>
+            <Text style={styles.ecoinSectionText}>
+              Toque no botão abaixo para abrir a loja de pacotes de Ecoin.
+            </Text>
+            <Pressable
+              onPress={() => router.push("/payments/ecoin")}
+              style={styles.buyBtn}
+            >
+              <Text style={styles.buyBtnText}>Ir para loja de Ecoin</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : visibleItems.length === 0 && visibleGymCustomizationItems.length === 0 ? (
         <View style={styles.emptyCard}>
           <Text style={styles.emptyTitle}>Sem itens na loja</Text>
           <Text style={styles.emptyText}>No web, marque itens com "Disponibilizar este item na loja".</Text>
         </View>
       ) : (
         <View style={{ gap: 10 }}>
-          {shopItems.map((item) => (
+          {visibleItems.map((item) => (
             <View key={item.id} style={styles.itemCard}>
               <View style={styles.itemImageWrap}>
-                <Image source={{ uri: getItemImageUrl(item.id) }} style={styles.itemImage} resizeMode="contain" />
+                {item.imageUrl ? (
+                  <Image source={{ uri: item.imageUrl }} style={styles.itemImage} resizeMode="cover" />
+                ) : item.category === "monetized" ? (
+                  <LinearGradient colors={["#0f766e", "#1d4ed8"]} style={styles.itemImageFallback}>
+                    <Ionicons name="diamond-outline" size={22} color={COLORS.white} />
+                  </LinearGradient>
+                ) : (
+                  <Image source={{ uri: getItemImageUrl(item.id) }} style={styles.itemImage} resizeMode="contain" />
+                )}
               </View>
 
               <View style={{ flex: 1 }}>
@@ -693,21 +1306,76 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
                 <Text style={styles.itemPrice}>{renderPrice(item)}</Text>
               </View>
 
-              <Pressable onPress={() => openBuyModal(item)} style={styles.buyBtn}>
+              <Pressable onPress={() => openShopItemModal(item)} style={styles.buyBtn}>
                 <Text style={styles.buyBtnText}>Comprar</Text>
               </Pressable>
             </View>
           ))}
+          {section === "elo" && visibleGymCustomizationItems.length ? (
+            <View style={{ gap: 10 }}>
+              <Text style={styles.pendingTitle}>NPCs e cenarios do GYM</Text>
+              {visibleGymCustomizationItems.map((item) => (
+                <View key={`${item.kind}-${item.id}`} style={styles.itemCard}>
+                  <View style={styles.itemImageWrap}>
+                    {item.imageUrl ? (
+                      <Image source={{ uri: item.imageUrl }} style={styles.itemImage} resizeMode="cover" />
+                    ) : (
+                      <LinearGradient
+                        colors={item.kind === "scenario" ? ["#7c3aed", "#2563eb"] : ["#0f766e", "#0891b2"]}
+                        style={styles.itemImageFallback}
+                      >
+                        <Ionicons name={item.kind === "scenario" ? "image-outline" : "people-outline"} size={22} color={COLORS.white} />
+                      </LinearGradient>
+                    )}
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.itemName}>{item.name}</Text>
+                    <Text style={styles.itemDesc}>{item.description}</Text>
+                    <Text style={styles.itemPrice}>{item.kind === "scenario" ? "Cenario" : "NPC"} • {item.price} ECoins</Text>
+                    <Text style={styles.itemDesc}>{item.unlocked ? "Ja desbloqueado na conta." : "Disponivel para uso no fluxo de criacao do GYM."}</Text>
+                  </View>
+                  <Pressable
+                    onPress={() => {
+                      if (item.unlocked) return;
+                      Alert.alert(
+                        "EloMart",
+                        `Deseja desbloquear ${item.name} por ${item.price} ECoins?`,
+                        [
+                          { text: "Cancelar", style: "cancel" },
+                          {
+                            text: "Desbloquear",
+                            onPress: () => {
+                              void purchaseGymCustomization(item)
+                                .then(() => {
+                                  Alert.alert("EloMart", `${item.name} foi desbloqueado com sucesso.`);
+                                })
+                                .catch((error: unknown) => {
+                                  const message = error instanceof Error ? error.message : "Falha ao desbloquear item.";
+                                  Alert.alert("EloMart", message);
+                                });
+                            },
+                          },
+                        ]
+                      );
+                    }}
+                    style={[styles.buyBtn, item.unlocked ? styles.buyBtnDisabled : null]}
+                  >
+                    <Text style={styles.buyBtnText}>{item.unlocked ? "Liberado" : "Desbloquear"}</Text>
+                  </Pressable>
+                </View>
+              ))}
+            </View>
+          ) : null}
         </View>
       )}
 
-      <Modal visible={!!selectedItem} transparent animationType="fade" onRequestClose={() => setSelectedItem(null)}>
+      <Modal visible={!!selectedOffer} transparent animationType="fade" onRequestClose={() => setSelectedOffer(null)}>
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
-            {!selectedItem ? null : (
+            {!selectedOffer ? null : selectedOffer.kind === "shop" ? (
               <>
-                <Text style={styles.modalTitle}>Comprar {selectedItem.name}</Text>
-                <Text style={styles.modalSub}>{selectedItem.description}</Text>
+                <Text style={styles.modalTitle}>Comprar {selectedOffer.item.name}</Text>
+                <Text style={styles.modalSub}>{selectedOffer.item.description}</Text>
 
                 <View style={styles.qtyRow}>
                   <Text style={styles.modalLabel}>Quantidade</Text>
@@ -724,7 +1392,7 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
 
                 <Text style={styles.modalLabel}>Forma de pagamento</Text>
                 <View style={styles.methodGrid}>
-                  {(selectedItem.sellMode === "game" || selectedItem.sellMode === "both") && (
+                  {(selectedOffer.item.sellMode === "game" || selectedOffer.item.sellMode === "both") && (
                     <Pressable
                       style={[styles.methodBtn, method === "GAME" && styles.methodBtnActive]}
                       onPress={() => setMethod("GAME")}
@@ -732,7 +1400,7 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
                       <Text style={styles.methodText}>Moedas</Text>
                     </Pressable>
                   )}
-                  {(selectedItem.sellMode === "ecoin" || selectedItem.sellMode === "both") && (
+                  {(selectedOffer.item.sellMode === "ecoin" || selectedOffer.item.sellMode === "both") && (
                     <>
                       <Pressable
                         style={[styles.methodBtn, method === "PIX" && styles.methodBtnActive]}
@@ -761,7 +1429,32 @@ async function createOnlineOrder(item: ShopItem, purchaseQty: number, onlineMeth
                 </Text>
 
                 <View style={styles.modalActions}>
-                  <Pressable disabled={submitting} style={styles.cancelBtn} onPress={() => setSelectedItem(null)}>
+                  <Pressable disabled={submitting} style={styles.cancelBtn} onPress={() => setSelectedOffer(null)}>
+                    <Text style={styles.cancelText}>Cancelar</Text>
+                  </Pressable>
+                  <Pressable disabled={submitting} style={styles.confirmBtn} onPress={onConfirmPurchase}>
+                    {submitting ? (
+                      <ActivityIndicator color={COLORS.white} />
+                    ) : (
+                      <Text style={styles.confirmText}>Confirmar</Text>
+                    )}
+                  </Pressable>
+                </View>
+              </>
+            ) : (
+              <>
+                <Text style={styles.modalTitle}>Comprar {selectedOffer.product.name}</Text>
+                <Text style={styles.modalSub}>{selectedOffer.product.description}</Text>
+                <Text style={styles.modalLabel}>Forma de pagamento</Text>
+                <View style={styles.methodGrid}>
+                  <Pressable style={[styles.methodBtn, styles.methodBtnActive]} onPress={() => setMethod("ECOIN")}>
+                    <Text style={styles.methodText}>ECoins</Text>
+                  </Pressable>
+                </View>
+                <Text style={styles.totalText}>Total: {selectedTotal} ECoins</Text>
+                <Text style={styles.modalSub}>{resolveMonetizedDeliveryInfo(selectedOffer.product).confirmationHint}</Text>
+                <View style={styles.modalActions}>
+                  <Pressable disabled={submitting} style={styles.cancelBtn} onPress={() => setSelectedOffer(null)}>
                     <Text style={styles.cancelText}>Cancelar</Text>
                   </Pressable>
                   <Pressable disabled={submitting} style={styles.confirmBtn} onPress={onConfirmPurchase}>
@@ -792,6 +1485,29 @@ const styles = StyleSheet.create({
   headerTitle: { color: COLORS.white, fontSize: 20, fontWeight: "900" },
   headerSub: { color: "rgba(255,255,255,0.9)", marginTop: 4, fontWeight: "800" },
   headerHint: { color: "rgba(255,255,255,0.7)", marginTop: 6, fontWeight: "700", fontSize: 12 },
+
+  tabRow: { flexDirection: "row", gap: 6, marginTop: 10, marginBottom: 6 },
+  tabBtn: {
+    flex: 1,
+    paddingVertical: 8,
+    borderRadius: 10,
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.08)",
+  },
+  tabBtnActive: {
+    backgroundColor: "rgba(34,197,94,0.9)",
+  },
+  tabText: { color: COLORS.white, fontWeight: "700" },
+
+  ecoinSectionCard: {
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.10)",
+    padding: 14,
+  },
+  ecoinSectionTitle: { color: COLORS.white, fontWeight: "900", fontSize: 16, marginBottom: 6 },
+  ecoinSectionText: { color: "rgba(255,255,255,0.75)", marginBottom: 10, fontWeight: "700", lineHeight: 18 },
 
   pendingWrap: {
     borderRadius: 14,
@@ -849,6 +1565,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     overflow: "hidden",
   },
+  itemImageFallback: { width: "100%", height: "100%", alignItems: "center", justifyContent: "center" },
   itemImage: { width: 36, height: 36 },
   itemName: { color: COLORS.white, fontWeight: "900", fontSize: 14 },
   itemDesc: { color: "rgba(255,255,255,0.72)", marginTop: 2, fontSize: 11, lineHeight: 16 },
@@ -859,6 +1576,7 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     paddingHorizontal: 12,
   },
+  buyBtnDisabled: { opacity: 0.55 },
   buyBtnText: { color: COLORS.white, fontWeight: "900", fontSize: 12 },
 
   modalBackdrop: {
@@ -933,3 +1651,5 @@ const styles = StyleSheet.create({
   },
   confirmText: { color: COLORS.white, fontWeight: "900" },
 });
+
+

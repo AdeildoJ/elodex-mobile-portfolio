@@ -3,7 +3,15 @@ export type BagTabKey = "TEAM" | "ITEMS" | "POKEBALLS";
 export type PlayerTier = "FREE" | "VIP";
 
 export type InventoryKind = "ITEM" | "POKEBALL";
-export type ItemEffectType = "HEAL" | "REVIVE" | "LEVEL_UP" | "TEACH_MOVE";
+export type ItemEffectType =
+  | "HEAL"
+  | "REVIVE"
+  | "LEVEL_UP"
+  | "TEACH_MOVE"
+  | "RESET_IV"
+  | "UNLOCK_GYM_SCENARIO"
+  | "UNLOCK_GYM_NPC"
+  | "ACTIVATE_GYM_MAIN_TEAM_SLOT";
 
 export type InventoryEntry = {
   id: string;
@@ -21,6 +29,8 @@ export type InventoryEntry = {
 
   captureBonus?: number;
   isMasterBall?: boolean;
+  imageUrl?: string | null;
+  metadata?: Record<string, unknown> | null;
 };
 
 export type ActionResult = {

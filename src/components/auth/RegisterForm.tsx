@@ -1,14 +1,18 @@
 import React, { useMemo, useState } from "react";
 import {
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
+  ActivityIndicator,
   Alert,
-  ScrollView,
+  Image,
+  ImageBackground,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+  useWindowDimensions,
 } from "react-native";
 import { useRouter } from "expo-router";
 import { LinearGradient } from "expo-linear-gradient";
@@ -29,8 +33,15 @@ import {
 
 import { COLORS } from "../../theme/colors";
 
+const TEAL_DARK = "#144552";
+const SKY_CARD = "#CDEEFF";
+const FIELD_BG = "#F4FBFF";
+
 export default function RegisterForm() {
   const router = useRouter();
+  const { width } = useWindowDimensions();
+  const isWeb = Platform.OS === "web";
+  const showSidePanel = isWeb && width >= 960;
 
   const [nomeJogador, setNomeJogador] = useState("");
   const [dataNascimento, setDataNascimento] = useState("");
@@ -107,16 +118,183 @@ export default function RegisterForm() {
         e?.message?.includes("auth/email-already-in-use")
           ? "Este e-mail ja esta em uso."
           : e?.message?.includes("auth/invalid-email")
-          ? "E-mail invalido."
-          : e?.message?.includes("auth/weak-password")
-          ? "Senha fraca."
-          : e?.message || "Erro ao registrar.";
+            ? "E-mail invalido."
+            : e?.message?.includes("auth/weak-password")
+              ? "Senha fraca."
+              : e?.message || "Erro ao registrar.";
 
       Alert.alert("Erro", msg);
     } finally {
       setLoading(false);
     }
   };
+
+  const renderInput = (
+    label: string,
+    value: string,
+    onChangeText: (value: string) => void,
+    options?: {
+      placeholder?: string;
+      keyboardType?: "default" | "number-pad" | "email-address";
+      autoCapitalize?: "none" | "words";
+      maxLength?: number;
+      secureTextEntry?: boolean;
+      rightAction?: React.ReactNode;
+    }
+  ) => (
+    <View style={styles.fieldBlock}>
+      <Text style={isWeb ? styles.webLabel : styles.label}>{label}</Text>
+      <View style={isWeb ? styles.webInputWrap : styles.inputWrap}>
+        <TextInput
+          style={isWeb ? styles.webInput : styles.input}
+          placeholder={options?.placeholder}
+          placeholderTextColor={isWeb ? "rgba(20,69,82,0.45)" : "#9aa0a6"}
+          keyboardType={options?.keyboardType}
+          autoCapitalize={options?.autoCapitalize}
+          maxLength={options?.maxLength}
+          secureTextEntry={options?.secureTextEntry}
+          value={value}
+          onChangeText={onChangeText}
+          editable={!loading}
+        />
+        {options?.rightAction}
+      </View>
+    </View>
+  );
+
+  if (isWeb) {
+    return (
+      <View style={styles.webScreen}>
+        <View style={[styles.webColumnLeft, showSidePanel ? styles.webColumnLeftDesktop : styles.webColumnFull]}>
+          <KeyboardAvoidingView behavior="padding" style={styles.webKeyboard}>
+            <ScrollView
+              contentContainerStyle={[
+                styles.webScrollContent,
+                showSidePanel ? styles.webScrollDesktop : styles.webScrollMobile,
+              ]}
+              keyboardShouldPersistTaps="handled"
+            >
+              <View style={styles.webCard}>
+                <View style={styles.webLogoWrap}>
+                  <Image
+                    source={require("../../../assets/images/EloDexLogo.png")}
+                    style={styles.webLogo}
+                    resizeMode="contain"
+                  />
+                </View>
+
+                <Text style={styles.webTitle}>Criar conta</Text>
+                <Text style={styles.webSubtitle}>Preencha seus dados para entrar no EloDex.</Text>
+
+                {renderInput("Nome do Jogador", nomeJogador, setNomeJogador, {
+                  placeholder: "Digite seu nome",
+                  autoCapitalize: "words",
+                })}
+
+                {renderInput("Data de Nascimento", dataNascimento, (v) => setDataNascimento(formatDOB(v)), {
+                  placeholder: "DD/MM/AAAA",
+                  keyboardType: "number-pad",
+                  maxLength: 10,
+                })}
+
+                {renderInput("CPF", cpf, (v) => setCpf(formatCPF(v)), {
+                  placeholder: "Somente numeros",
+                  keyboardType: "number-pad",
+                  maxLength: 14,
+                })}
+
+                {renderInput("E-mail", email, setEmail, {
+                  placeholder: "Digite seu e-mail",
+                  keyboardType: "email-address",
+                  autoCapitalize: "none",
+                })}
+
+                {renderInput("Confirmar E-mail", confirmEmail, setConfirmEmail, {
+                  placeholder: "Repita seu e-mail",
+                  keyboardType: "email-address",
+                  autoCapitalize: "none",
+                })}
+
+                {renderInput("Criar Senha", senha, setSenha, {
+                  placeholder: "Digite sua senha",
+                  autoCapitalize: "none",
+                  secureTextEntry: !showSenha,
+                  rightAction: (
+                    <Pressable
+                      style={styles.webInlineAction}
+                      onPress={() => setShowSenha((s) => !s)}
+                      disabled={loading}
+                    >
+                      <Text style={styles.webInlineActionText}>{showSenha ? "Ocultar" : "Mostrar"}</Text>
+                    </Pressable>
+                  ),
+                })}
+
+                <Text style={styles.webHint}>
+                  Use pelo menos 6 caracteres com letra maiuscula, minuscula, numero e simbolo.
+                </Text>
+
+                {renderInput("Confirmar Senha", confirmSenha, setConfirmSenha, {
+                  placeholder: "Repita sua senha",
+                  autoCapitalize: "none",
+                  secureTextEntry: !showConfirmSenha,
+                  rightAction: (
+                    <Pressable
+                      style={styles.webInlineAction}
+                      onPress={() => setShowConfirmSenha((s) => !s)}
+                      disabled={loading}
+                    >
+                      <Text style={styles.webInlineActionText}>
+                        {showConfirmSenha ? "Ocultar" : "Mostrar"}
+                      </Text>
+                    </Pressable>
+                  ),
+                })}
+
+                <Pressable
+                  onPress={handleRegister}
+                  disabled={!canSubmit}
+                  style={[styles.webPrimaryButton, !canSubmit && styles.webPrimaryButtonDisabled]}
+                >
+                  {loading ? (
+                    <ActivityIndicator color={COLORS.white} />
+                  ) : (
+                    <Text style={styles.webPrimaryButtonText}>Criar conta</Text>
+                  )}
+                </Pressable>
+
+                <Pressable onPress={() => router.replace("/auth/login")} disabled={loading}>
+                  <Text style={styles.webLink}>Ja tenho conta</Text>
+                </Pressable>
+              </View>
+            </ScrollView>
+          </KeyboardAvoidingView>
+        </View>
+
+        {showSidePanel && (
+          <ImageBackground
+            source={require("../../../assets/images/fundopokemon.png")}
+            resizeMode="cover"
+            style={styles.webColumnRight}
+          >
+            <LinearGradient
+              colors={["rgba(255,255,255,0.10)", "rgba(0,0,0,0.28)"]}
+              style={StyleSheet.absoluteFill}
+            />
+            <View style={styles.webHeroContent}>
+              <Image
+                source={require("../../../assets/images/EloDexLogo.png")}
+                style={styles.webHeroLogo}
+                resizeMode="contain"
+              />
+              <Text style={styles.webHeroTitle}>EloDex</Text>
+              <Text style={styles.webHeroText}>Modo web de cadastro ajustado para o mesmo clima visual do ConectaFe.</Text>
+            </View>
+          </ImageBackground>
+        )}
+      </View>
+    );
+  }
 
   return (
     <View style={styles.screen}>
@@ -138,64 +316,34 @@ export default function RegisterForm() {
           </View>
 
           <View style={styles.card}>
-            <Text style={styles.label}>Nome Jogador</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Apenas texto"
-              placeholderTextColor="#9aa0a6"
-              value={nomeJogador}
-              onChangeText={setNomeJogador}
-              autoCapitalize="words"
-              editable={!loading}
-            />
+            {renderInput("Nome Jogador", nomeJogador, setNomeJogador, {
+              placeholder: "Apenas texto",
+              autoCapitalize: "words",
+            })}
 
-            <Text style={styles.label}>Data de Nascimento</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="DD/MM/AAAA"
-              placeholderTextColor="#9aa0a6"
-              keyboardType="number-pad"
-              value={dataNascimento}
-              onChangeText={(v) => setDataNascimento(formatDOB(v))}
-              maxLength={10}
-              editable={!loading}
-            />
+            {renderInput("Data de Nascimento", dataNascimento, (v) => setDataNascimento(formatDOB(v)), {
+              placeholder: "DD/MM/AAAA",
+              keyboardType: "number-pad",
+              maxLength: 10,
+            })}
 
-            <Text style={styles.label}>CPF</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Somente numeros (11 digitos)"
-              placeholderTextColor="#9aa0a6"
-              keyboardType="number-pad"
-              value={cpf}
-              onChangeText={(v) => setCpf(formatCPF(v))}
-              maxLength={11}
-              editable={!loading}
-            />
+            {renderInput("CPF", cpf, (v) => setCpf(formatCPF(v)), {
+              placeholder: "Somente numeros (11 digitos)",
+              keyboardType: "number-pad",
+              maxLength: 14,
+            })}
 
-            <Text style={styles.label}>Email</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="email@exemplo.com"
-              placeholderTextColor="#9aa0a6"
-              keyboardType="email-address"
-              autoCapitalize="none"
-              value={email}
-              onChangeText={setEmail}
-              editable={!loading}
-            />
+            {renderInput("Email", email, setEmail, {
+              placeholder: "email@exemplo.com",
+              keyboardType: "email-address",
+              autoCapitalize: "none",
+            })}
 
-            <Text style={styles.label}>Confirmar Email</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Repita o e-mail"
-              placeholderTextColor="#9aa0a6"
-              keyboardType="email-address"
-              autoCapitalize="none"
-              value={confirmEmail}
-              onChangeText={setConfirmEmail}
-              editable={!loading}
-            />
+            {renderInput("Confirmar Email", confirmEmail, setConfirmEmail, {
+              placeholder: "Repita o e-mail",
+              keyboardType: "email-address",
+              autoCapitalize: "none",
+            })}
 
             <Text style={styles.label}>Criar Senha</Text>
             <View style={styles.passwordRow}>
@@ -209,10 +357,9 @@ export default function RegisterForm() {
                 autoCapitalize="none"
                 editable={!loading}
               />
-              <TouchableOpacity
+              <Pressable
                 style={styles.eyeButton}
                 onPress={() => setShowSenha((s) => !s)}
-                activeOpacity={0.85}
                 disabled={loading}
               >
                 <Ionicons
@@ -220,7 +367,7 @@ export default function RegisterForm() {
                   size={20}
                   color={COLORS.primary}
                 />
-              </TouchableOpacity>
+              </Pressable>
             </View>
             <Text style={styles.hint}>Use pelo menos 6 caracteres com letra, numero e simbolo.</Text>
 
@@ -236,10 +383,9 @@ export default function RegisterForm() {
                 autoCapitalize="none"
                 editable={!loading}
               />
-              <TouchableOpacity
+              <Pressable
                 style={styles.eyeButton}
                 onPress={() => setShowConfirmSenha((s) => !s)}
-                activeOpacity={0.85}
                 disabled={loading}
               >
                 <Ionicons
@@ -247,23 +393,27 @@ export default function RegisterForm() {
                   size={20}
                   color={COLORS.primary}
                 />
-              </TouchableOpacity>
+              </Pressable>
             </View>
 
-            <TouchableOpacity onPress={handleRegister} disabled={!canSubmit} activeOpacity={0.9}>
+            <Pressable onPress={handleRegister} disabled={!canSubmit}>
               <LinearGradient
                 colors={[COLORS.primary, COLORS.secondary]}
                 start={{ x: 0, y: 0 }}
                 end={{ x: 1, y: 1 }}
                 style={[styles.gradientButton, !canSubmit && styles.buttonDisabled]}
               >
-                <Text style={styles.gradientButtonText}>{loading ? "Criando..." : "Criar conta"}</Text>
+                {loading ? (
+                  <ActivityIndicator color={COLORS.white} />
+                ) : (
+                  <Text style={styles.gradientButtonText}>Criar conta</Text>
+                )}
               </LinearGradient>
-            </TouchableOpacity>
+            </Pressable>
 
-            <TouchableOpacity onPress={() => router.replace("/auth/login")} disabled={loading}>
+            <Pressable onPress={() => router.replace("/auth/login")} disabled={loading}>
               <Text style={styles.link}>Ja tenho conta</Text>
-            </TouchableOpacity>
+            </Pressable>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -301,18 +451,21 @@ const styles = StyleSheet.create({
     elevation: 3,
   },
 
-  label: { color: "#555", fontSize: 12, marginBottom: 6, marginTop: 12, fontWeight: "800" },
+  fieldBlock: { marginTop: 12 },
+  label: { color: "#555", fontSize: 12, marginBottom: 6, fontWeight: "800" },
   hint: { color: "rgba(45,45,45,0.65)", marginTop: 8, fontSize: 12, fontWeight: "600" },
 
-  input: {
+  inputWrap: {
     backgroundColor: "rgba(167,139,250,0.20)",
     borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(45,45,45,0.08)",
+  },
+  input: {
     paddingVertical: 12,
     paddingHorizontal: 12,
     color: COLORS.dark,
     fontSize: 14,
-    borderWidth: 1,
-    borderColor: "rgba(45,45,45,0.08)",
   },
 
   gradientButton: {
@@ -324,10 +477,9 @@ const styles = StyleSheet.create({
   },
   gradientButtonText: { color: COLORS.white, fontSize: 16, fontWeight: "900" },
   buttonDisabled: { opacity: 0.55 },
-
   link: { color: COLORS.primary, marginTop: 14, textAlign: "center", fontWeight: "900" },
 
-  passwordRow: { flexDirection: "row", alignItems: "center" },
+  passwordRow: { flexDirection: "row", alignItems: "center", marginTop: 6 },
   passwordInput: { flex: 1 },
   eyeButton: {
     marginLeft: 10,
@@ -339,5 +491,166 @@ const styles = StyleSheet.create({
     borderColor: "rgba(9, 9, 9, 0.12)",
     alignItems: "center",
     justifyContent: "center",
+  },
+
+  webScreen: {
+    flex: 1,
+    flexDirection: "row",
+    backgroundColor: COLORS.white,
+  },
+  webColumnLeft: {
+    backgroundColor: TEAL_DARK,
+  },
+  webColumnLeftDesktop: {
+    width: "44%",
+    minWidth: 420,
+  },
+  webColumnFull: {
+    width: "100%",
+  },
+  webKeyboard: {
+    flex: 1,
+  },
+  webScrollContent: {
+    flexGrow: 1,
+    justifyContent: "center",
+    paddingHorizontal: 24,
+    paddingVertical: 32,
+  },
+  webScrollDesktop: {
+    paddingTop: 40,
+    paddingBottom: 40,
+  },
+  webScrollMobile: {
+    paddingTop: 24,
+    paddingBottom: 24,
+  },
+  webCard: {
+    width: "100%",
+    maxWidth: 560,
+    alignSelf: "center",
+    backgroundColor: SKY_CARD,
+    borderRadius: 28,
+    paddingHorizontal: 28,
+    paddingVertical: 24,
+    shadowColor: "#000",
+    shadowOpacity: 0.14,
+    shadowRadius: 24,
+    elevation: 12,
+  },
+  webLogoWrap: {
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  webLogo: {
+    width: 220,
+    height: 120,
+  },
+  webTitle: {
+    color: "#000",
+    fontSize: 30,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  webSubtitle: {
+    marginTop: 6,
+    marginBottom: 10,
+    textAlign: "center",
+    color: "rgba(20,69,82,0.80)",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  webLabel: {
+    color: TEAL_DARK,
+    fontSize: 13,
+    marginBottom: 6,
+    fontWeight: "800",
+  },
+  webInputWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: 16,
+    backgroundColor: FIELD_BG,
+    borderWidth: 1,
+    borderColor: "rgba(20,69,82,0.16)",
+    paddingHorizontal: 14,
+  },
+  webInput: {
+    flex: 1,
+    color: "#111",
+    paddingVertical: 13,
+    fontSize: 15,
+    fontWeight: "600",
+  },
+  webInlineAction: {
+    paddingLeft: 12,
+    paddingVertical: 10,
+  },
+  webInlineActionText: {
+    color: TEAL_DARK,
+    textDecorationLine: "underline",
+    fontWeight: "800",
+    fontSize: 12,
+  },
+  webHint: {
+    marginTop: 8,
+    color: "rgba(20,69,82,0.75)",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  webPrimaryButton: {
+    marginTop: 18,
+    backgroundColor: TEAL_DARK,
+    borderRadius: 16,
+    paddingVertical: 15,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  webPrimaryButtonDisabled: {
+    opacity: 0.55,
+  },
+  webPrimaryButtonText: {
+    color: COLORS.white,
+    fontSize: 15,
+    fontWeight: "900",
+  },
+  webLink: {
+    marginTop: 16,
+    textAlign: "center",
+    color: TEAL_DARK,
+    fontWeight: "800",
+    textDecorationLine: "underline",
+  },
+  webColumnRight: {
+    flex: 1,
+    position: "relative",
+  },
+  webHeroContent: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 40,
+  },
+  webHeroLogo: {
+    width: 320,
+    height: 180,
+  },
+  webHeroTitle: {
+    marginTop: 8,
+    color: COLORS.white,
+    fontSize: 52,
+    fontWeight: "900",
+    textShadowColor: "rgba(0,0,0,0.35)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 10,
+  },
+  webHeroText: {
+    marginTop: 12,
+    maxWidth: 360,
+    textAlign: "center",
+    color: "rgba(255,255,255,0.92)",
+    fontSize: 16,
+    fontWeight: "700",
+    lineHeight: 24,
   },
 });

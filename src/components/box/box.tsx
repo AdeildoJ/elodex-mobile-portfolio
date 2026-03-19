@@ -31,6 +31,14 @@ export function Box({
   team,
   box,
   onClose,
+  title = "BOX",
+  capacityLimitOverride,
+  teamPanelTitle = "TIME (selecione um slot)",
+  boxPanelTitle = "POKEMON NO BOX",
+  primaryActionLabel,
+  emptyBoxText = "Capture Pokemon ou mova do time para guardar aqui.",
+  extraTeamActionLabel,
+  onExtraTeamAction,
 
   // transfers
   onSwapTeamWithBox,
@@ -41,12 +49,25 @@ export function Box({
   team: TeamPokemonUI[];
   box: TeamPokemonUI[];
   onClose: () => void;
+  title?: string;
+  capacityLimitOverride?: number;
+  teamPanelTitle?: string;
+  boxPanelTitle?: string;
+  primaryActionLabel?: string;
+  emptyBoxText?: string;
+  extraTeamActionLabel?: string | null;
+  onExtraTeamAction?: (teamSlotIndex: number) => void;
 
   onSwapTeamWithBox: (teamSlotIndex: number, boxIndex: number) => void;
   onMoveTeamToBox: (teamSlotIndex: number) => void;
   onMoveBoxToTeam: (boxIndex: number, teamSlotIndex: number) => void;
 }) {
-  const boxLimit = useMemo(() => getBoxLimit(playerType), [playerType]);
+  const boxLimit = useMemo(
+    () => Math.max(1, Number(capacityLimitOverride || getBoxLimit(playerType))),
+    [capacityLimitOverride, playerType]
+  );
+  void boxPanelTitle;
+  void emptyBoxText;
   const boxCount = box.length;
   const isBoxFull = boxCount >= boxLimit;
 
@@ -170,7 +191,7 @@ export function Box({
         {/* TOP BAR */}
         <View style={styles.topBar}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.title}>BOX</Text>
+            <Text style={styles.title}>{title}</Text>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
               <Text style={styles.subtitle}>{`Capacidade: ${boxCount}/${boxLimit}`}</Text>
               {playerType === "VIP" ? (
@@ -194,7 +215,7 @@ export function Box({
 
         {/* TEAM SELECTOR */}
         <LinearGradient colors={["rgba(59,130,246,0.20)", "rgba(167,139,250,0.10)"]} style={styles.teamPanel}>
-          <Text style={styles.panelTitle}>TIME (selecione um slot)</Text>
+          <Text style={styles.panelTitle}>{teamPanelTitle}</Text>
           <View style={styles.teamSlotsRow}>
             {team.map((p, idx) => renderTeamSlot(p, idx))}
           </View>
@@ -242,11 +263,20 @@ export function Box({
               >
                 <ArrowLeftRight size={16} color={COLORS.white} />
                 <Text style={styles.primaryBtnText}>
-                  {isBoxFull ? "BOX cheio" : "Mover p/ BOX"}
+                  {isBoxFull ? "BOX cheio" : primaryActionLabel || "Mover p/ BOX"}
                 </Text>
               </LinearGradient>
             </Pressable>
           </View>
+          {extraTeamActionLabel && onExtraTeamAction ? (
+            <View style={{ marginTop: 10 }}>
+              <Pressable onPress={() => onExtraTeamAction(selectedTeamSlot)}>
+                <LinearGradient colors={["rgba(16,185,129,0.24)", "rgba(59,130,246,0.16)"]} style={styles.secondaryBtn}>
+                  <Text style={styles.primaryBtnText}>{extraTeamActionLabel}</Text>
+                </LinearGradient>
+              </Pressable>
+            </View>
+          ) : null}
 
           {isBoxFull && playerType === "FREE" ? (
             <Text style={styles.limitHint}>Seu BOX está cheio. Vire VIP para expandir.</Text>
@@ -436,6 +466,15 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255,255,255,0.12)",
     flexDirection: "row",
     gap: 8,
+  },
+  secondaryBtn: {
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
   },
   primaryBtnText: { color: COLORS.white, fontWeight: "900", fontSize: 12, letterSpacing: 0.5 },
 

@@ -9,12 +9,24 @@ type EggItem = {
   speciesName: string;
   stepsRequired: number;
   stepsProgress: number;
-  status: "incubating" | "ready" | "hatched";
+  status: "stored" | "incubating" | "ready" | "hatched";
   inheritedEggMoves?: string[];
   hatchMode?: "steps" | "time";
   readyAtMs?: number | null;
   requiresIncubator?: boolean;
   incubatorAssignedAt?: unknown;
+  startedAtMs?: number | null;
+  endsAtMs?: number | null;
+  incubatorId?: string | null;
+  storageLocation?: "team" | "box";
+  storageSlotIndex?: number | null;
+};
+
+type IncubatorOption = {
+  id: string;
+  name: string;
+  quantity: number;
+  hatchDays: number;
 };
 
 type Props = {
@@ -38,9 +50,10 @@ type Props = {
   daycareUnlocked?: boolean;
   daycareUnlockHint?: string | null;
   incubatorCount?: number;
+  incubators?: IncubatorOption[];
   onHatchEgg: (eggId: string) => Promise<void> | void;
   onCreateEgg: (slotA: number, slotB: number) => Promise<void> | void;
-  onAssignIncubator: (eggId: string) => Promise<void> | void;
+  onAssignIncubator: (eggId: string, incubatorId?: string) => Promise<void> | void;
   onSetDaycareParents: (slotA: number, slotB: number) => Promise<void> | void;
   onToggleDaycare: (active: boolean) => Promise<void> | void;
   onClearDaycare: () => Promise<void> | void;
@@ -58,6 +71,7 @@ export function EggsPanel({
   daycareUnlocked = true,
   daycareUnlockHint = null,
   incubatorCount = 0,
+  incubators = [],
   onHatchEgg,
   onCreateEgg,
   onAssignIncubator,
@@ -66,6 +80,8 @@ export function EggsPanel({
   onClearDaycare,
 }: Props) {
   const activeEggs = eggs.filter((e) => e.status !== "hatched");
+  const teamEggs = activeEggs.filter((egg) => egg.storageLocation === "team");
+  const boxEggs = activeEggs.filter((egg) => egg.storageLocation !== "team");
   const teamSlots = useMemo(
     () =>
       team
@@ -173,20 +189,21 @@ export function EggsPanel({
       {!activeEggs.length ? (
         <View style={styles.empty}>
           <Text style={styles.emptyTitle}>Sem ovos em incubacao</Text>
-          <Text style={styles.emptyText}>Explore para progredir quando houver ovos ativos.</Text>
+          <Text style={styles.emptyText}>Compre ou gere um ovo e inicie a incubacao manualmente.</Text>
         </View>
       ) : (
         <View style={{ gap: 8 }}>
-          {activeEggs.map((egg) => {
+          {teamEggs.length ? <Text style={styles.sectionTitle}>Ovos reservados no time</Text> : null}
+          {teamEggs.map((egg) => {
             const progress = Math.max(0, Number(egg.stepsProgress || 0));
             const required = Math.max(1, Number(egg.stepsRequired || 1));
             const hatchMode = egg.hatchMode === "time" ? "time" : "steps";
-            const readyAtMs = Math.max(0, Number(egg.readyAtMs || 0));
+            const readyAtMs = Math.max(0, Number(egg.endsAtMs || egg.readyAtMs || 0));
             const readyByTime = hatchMode === "time" && readyAtMs > 0 && Date.now() >= readyAtMs;
             const ready = egg.status === "ready" || readyByTime || progress >= required;
-            const requiresIncubator = hatchMode === "steps" && !!egg.requiresIncubator;
+            const requiresIncubator = !!egg.requiresIncubator;
             const incubatorAssigned = !!egg.incubatorAssignedAt;
-            const needsIncubator = !ready && requiresIncubator && !incubatorAssigned;
+            const needsIncubator = egg.status === "stored" && requiresIncubator && !incubatorAssigned;
             const remainingMs = hatchMode === "time" && readyAtMs > 0 ? Math.max(0, readyAtMs - Date.now()) : 0;
             const hours = Math.floor(remainingMs / (1000 * 60 * 60));
             const minutes = Math.floor((remainingMs % (1000 * 60 * 60)) / (1000 * 60));
@@ -198,10 +215,77 @@ export function EggsPanel({
               >
                 <View style={styles.rowTop}>
                   <Text style={styles.name}>{egg.speciesName} Egg</Text>
-                  <Text style={styles.badge}>{ready ? "Pronto" : "Incubando"}</Text>
+                  <Text style={styles.badge}>{ready ? "Pronto" : egg.status === "stored" ? "Armazenado" : "Incubando"}</Text>
                 </View>
+                <Text style={styles.meta}>Local: Time principal{egg.storageSlotIndex ? ` • Slot ${egg.storageSlotIndex}` : ""}</Text>
+                {egg.status === "stored" ? (
+                  <>
+                    <Text style={styles.meta}>Esse ovo aguarda incubacao manual.</Text>
+                    <Text style={styles.meta}>Incubadoras disponiveis: {incubatorCount}</Text>
+                  </>
+                ) : hatchMode === "steps" ? (
+                  <>
+                    <Text style={styles.meta}>{progress}/{required} passos</Text>
+                    <View style={styles.barTrack}>
+                      <View style={[styles.barFill, { width: `${pct(progress, required)}%` }]} />
+                    </View>
+                  </>
+                ) : (
+                  <Text style={styles.meta}>Hatch por tempo: {ready ? "pronto" : `${hours}h ${minutes}m restantes`}</Text>
+                )}
+                {!!egg.inheritedEggMoves?.length ? <Text style={styles.meta}>Egg Moves: {egg.inheritedEggMoves.join(", ")}</Text> : null}
+                {!!egg.incubatorId ? <Text style={styles.meta}>Incubadora: {egg.incubatorId}</Text> : null}
+                {needsIncubator ? (
+                  <View style={styles.incubatorList}>
+                    {incubators.length ? incubators.map((incubator) => (
+                      <Pressable key={`${egg.id}-${incubator.id}`} onPress={() => onAssignIncubator(egg.id, incubator.id)} style={styles.hatchBtn}>
+                        <Text style={styles.hatchBtnText}>Usar {incubator.name} ({incubator.quantity}x)</Text>
+                      </Pressable>
+                    )) : (
+                      <Pressable onPress={() => onAssignIncubator(egg.id)} style={[styles.hatchBtn, styles.hatchBtnDisabled]} disabled>
+                        <Text style={styles.hatchBtnText}>Sem incubadora disponivel</Text>
+                      </Pressable>
+                    )}
+                  </View>
+                ) : null}
+                <Pressable onPress={() => onHatchEgg(egg.id)} disabled={!ready} style={[styles.hatchBtn, !ready && styles.hatchBtnDisabled]}>
+                  <Text style={styles.hatchBtnText}>{ready ? "Chocar" : "Aguardando"}</Text>
+                </Pressable>
+              </LinearGradient>
+            );
+          })}
+          {boxEggs.length ? <Text style={styles.sectionTitle}>Ovos armazenados na BOX</Text> : null}
+          {boxEggs.map((egg) => {
+            const progress = Math.max(0, Number(egg.stepsProgress || 0));
+            const required = Math.max(1, Number(egg.stepsRequired || 1));
+            const hatchMode = egg.hatchMode === "time" ? "time" : "steps";
+            const readyAtMs = Math.max(0, Number(egg.endsAtMs || egg.readyAtMs || 0));
+            const readyByTime = hatchMode === "time" && readyAtMs > 0 && Date.now() >= readyAtMs;
+            const ready = egg.status === "ready" || readyByTime || progress >= required;
+            const requiresIncubator = !!egg.requiresIncubator;
+            const incubatorAssigned = !!egg.incubatorAssignedAt;
+            const needsIncubator = egg.status === "stored" && requiresIncubator && !incubatorAssigned;
+            const remainingMs = hatchMode === "time" && readyAtMs > 0 ? Math.max(0, readyAtMs - Date.now()) : 0;
+            const hours = Math.floor(remainingMs / (1000 * 60 * 60));
+            const minutes = Math.floor((remainingMs % (1000 * 60 * 60)) / (1000 * 60));
+            return (
+              <LinearGradient
+                key={egg.id}
+                colors={["rgba(59,130,246,0.18)", "rgba(255,255,255,0.05)"]}
+                style={styles.card}
+              >
+                <View style={styles.rowTop}>
+                  <Text style={styles.name}>{egg.speciesName} Egg</Text>
+                  <Text style={styles.badge}>{ready ? "Pronto" : egg.status === "stored" ? "Armazenado" : "Incubando"}</Text>
+                </View>
+                <Text style={styles.meta}>Local: BOX</Text>
 
-                {hatchMode === "steps" ? (
+                {egg.status === "stored" ? (
+                  <>
+                    <Text style={styles.meta}>Esse ovo aguarda incubacao manual.</Text>
+                    <Text style={styles.meta}>Incubadoras disponiveis: {incubatorCount}</Text>
+                  </>
+                ) : hatchMode === "steps" ? (
                   <>
                     <Text style={styles.meta}>{progress}/{required} passos</Text>
                     <View style={styles.barTrack}>
@@ -224,15 +308,27 @@ export function EggsPanel({
                 ) : null}
 
                 {needsIncubator ? (
-                  <Pressable
-                    onPress={() => onAssignIncubator(egg.id)}
-                    style={[styles.hatchBtn, incubatorCount <= 0 && styles.hatchBtnDisabled]}
-                    disabled={incubatorCount <= 0}
-                  >
-                    <Text style={styles.hatchBtnText}>
-                      {incubatorCount > 0 ? "Usar Chocadeira" : "Sem Chocadeira"}
-                    </Text>
-                  </Pressable>
+                  <View style={styles.incubatorList}>
+                    {incubators.length ? incubators.map((incubator) => (
+                      <Pressable
+                        key={`${egg.id}-${incubator.id}`}
+                        onPress={() => onAssignIncubator(egg.id, incubator.id)}
+                        style={styles.hatchBtn}
+                      >
+                        <Text style={styles.hatchBtnText}>
+                          Usar {incubator.name} ({incubator.quantity}x)
+                        </Text>
+                      </Pressable>
+                    )) : (
+                      <Pressable
+                        onPress={() => onAssignIncubator(egg.id)}
+                        style={[styles.hatchBtn, styles.hatchBtnDisabled]}
+                        disabled
+                      >
+                        <Text style={styles.hatchBtnText}>Sem incubadora disponivel</Text>
+                      </Pressable>
+                    )}
+                  </View>
                 ) : null}
 
                 <Pressable
@@ -329,6 +425,7 @@ const styles = StyleSheet.create({
   },
   emptyTitle: { color: COLORS.white, fontWeight: "800" },
   emptyText: { color: "rgba(255,255,255,0.72)", marginTop: 4, fontSize: 12 },
+  sectionTitle: { color: COLORS.white, fontWeight: "900", fontSize: 12, marginTop: 4 },
   card: {
     borderRadius: 12,
     borderWidth: 1,
@@ -359,4 +456,5 @@ const styles = StyleSheet.create({
   },
   hatchBtnDisabled: { opacity: 0.45 },
   hatchBtnText: { color: COLORS.white, fontWeight: "900", fontSize: 12 },
+  incubatorList: { gap: 6 },
 });

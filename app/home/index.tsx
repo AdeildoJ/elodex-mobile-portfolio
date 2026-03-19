@@ -20,15 +20,17 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 
 import { COLORS } from "../../src/theme/colors";
 import { auth } from "../../src/services/firebase/firebaseConfig";
-import { getPlayerProfile } from "../../src/services/firebase/players.service";
+import {
+  getPlayerProfile,
+  resolveEffectiveCharacterLimit,
+  resolveEffectivePlayerType,
+} from "../../src/services/firebase/players.service";
 import {
   deleteCharacterForPlayer,
   listenPlayerCharacters,
   PlayerCharacter,
   updateCharacterForPlayer,
 } from "../../src/services/firebase/characters.service";
-
-type GradientColors = readonly [string, string, ...string[]];
 
 const DOWNGRADE_GRACE_DAYS = 45;
 
@@ -53,15 +55,17 @@ export default function HomeScreen() {
 
   const [playerName, setPlayerName] = useState<string>("Jogador");
   const [playerType, setPlayerType] = useState<"FREE" | "VIP">("FREE");
+  const [maxCharacters, setMaxCharacters] = useState<number>(1);
+  const [vipExpiresText, setVipExpiresText] = useState<string | null>(null);
+  const [trainerLicenseText, setTrainerLicenseText] = useState<string | null>(null);
 
   const [showSettings, setShowSettings] = useState(false);
 
-  // Placeholder (saldo real a ser ligado depois)
-  const [ecoinBalance] = useState<number>(0);
+  const [ecoinBalance, setEcoinBalance] = useState<number>(0);
 
   const [characters, setCharacters] = useState<PlayerCharacter[]>([]);
 
-  const maxChars = useMemo(() => (playerType === "VIP" ? 3 : 1), [playerType]);
+  const maxChars = useMemo(() => Math.max(1, maxCharacters), [maxCharacters]);
   const canCreateMore = useMemo(
     () => characters.length < maxChars,
     [characters.length, maxChars]
@@ -74,8 +78,20 @@ export default function HomeScreen() {
     const profile = await getPlayerProfile(uid);
 
     setPlayerName(profile?.nomeJogador ?? "Jogador");
-    setPlayerType(
-      (profile?.playerType ?? "FREE").toUpperCase() === "VIP" ? "VIP" : "FREE"
+    setPlayerType(resolveEffectivePlayerType(profile));
+    setMaxCharacters(resolveEffectiveCharacterLimit(profile));
+
+    // ecoin balance
+    setEcoinBalance(Math.max(0, Number(profile?.ecoinBalance || 0)));
+
+    const vipExpiresAtMs = Number(profile?.vipExpiresAtMs || 0);
+    setVipExpiresText(vipExpiresAtMs > Date.now() ? new Date(vipExpiresAtMs).toLocaleDateString("pt-BR") : null);
+
+    const licenseExpiresAtMs = Number(profile?.trainerLicense?.expiresAtMs || 0);
+    setTrainerLicenseText(
+      profile?.trainerLicense?.status === "active" && licenseExpiresAtMs > Date.now()
+        ? new Date(licenseExpiresAtMs).toLocaleDateString("pt-BR")
+        : null
     );
   }
 
@@ -177,8 +193,27 @@ export default function HomeScreen() {
     }
   }
 
-  function onBuyEcoin() {
+  function onOpenStore() {
+    // redirect to purchase screen for Ecoin packages
     router.push("/payments/ecoin");
+  }
+
+  function onOpenBackpack() {
+    setShowSettings(false);
+    router.push("/home/backpack");
+  }
+
+  function onOpenPlayerSettings() {
+    setShowSettings(false);
+    router.push({
+      pathname: "/payments/vip",
+      params: { mode: playerType === "VIP" ? "manage" : "upgrade" },
+    });
+  }
+
+  function onOpenNotifications() {
+    setShowSettings(false);
+    router.push("/home/notifications");
   }
 
   function onVipCardPress() {
@@ -189,16 +224,6 @@ export default function HomeScreen() {
   }
 
   function onGoCreateCharacter() {
-    if (!canCreateMore) {
-      Alert.alert(
-        "Limite atingido",
-        playerType === "VIP"
-          ? "Você já atingiu o limite de 3 personagens."
-          : "Jogador FREE pode ter apenas 1 personagem."
-      );
-      return;
-    }
-
     router.push("/home/create-character");
   }
 
@@ -272,10 +297,6 @@ export default function HomeScreen() {
     );
   }
 
-  const vipGlow: GradientColors =
-    playerType === "VIP"
-      ? ["rgba(59,130,246,0.42)", "rgba(167,139,250,0.16)", "rgba(0,0,0,0)"]
-      : ["rgba(167,139,250,0.30)", "rgba(59,130,246,0.14)", "rgba(0,0,0,0)"];
 
   const createButtonBottom = insets.bottom + 18; // ✅ sobe o botão acima da barra do celular
   const listBottomPadding = 120 + insets.bottom; // ✅ espaço pro botão + safe area
@@ -305,13 +326,25 @@ export default function HomeScreen() {
               style={styles.settingsBtn}
               hitSlop={10}
             >
-              <Ionicons name="settings-outline" size={20} color={COLORS.white} />
+              <Ionicons name="menu-outline" size={22} color={COLORS.white} />
             </Pressable>
 
             {showSettings && (
               <View style={styles.settingsMenu}>
+                <Pressable onPress={onOpenBackpack} style={styles.settingsItem}>
+                  <Ionicons name="briefcase-outline" size={18} color={COLORS.white} />
+                  <Text style={styles.settingsText}>Mochila</Text>
+                </Pressable>
+                <Pressable onPress={onOpenPlayerSettings} style={styles.settingsItem}>
+                  <Ionicons name="settings-outline" size={18} color={COLORS.white} />
+                  <Text style={styles.settingsText}>Configuracoes</Text>
+                </Pressable>
+                <Pressable onPress={onOpenNotifications} style={styles.settingsItem}>
+                  <Ionicons name="notifications-outline" size={18} color={COLORS.white} />
+                  <Text style={styles.settingsText}>Notificacoes</Text>
+                </Pressable>
                 <Pressable onPress={onLogout} style={styles.settingsItem}>
-                  <Ionicons name="log-out-outline" size={18} color={COLORS.white} />
+                  <Ionicons name="power-outline" size={18} color={COLORS.white} />
                   <Text style={styles.settingsText}>Sair</Text>
                 </Pressable>
               </View>
@@ -322,31 +355,53 @@ export default function HomeScreen() {
         {/* VIP card */}
         <Pressable onPress={onVipCardPress} style={styles.vipCardWrap}>
           <LinearGradient
-            colors={vipGlow}
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 1 }}
+            colors={
+              playerType === "VIP"
+                ? ["#B45309", "#F59E0B", "#FDE68A"]
+                : ["#2563EB", "#7C3AED", "#F472B6"]
+            }
+            start={{ x: 0, y: 0.2 }}
+            end={{ x: 1, y: 0.8 }}
             style={styles.vipGlow}
           >
             <View style={styles.vipCard}>
+              <Text style={styles.vipEyebrow}>
+                {playerType === "VIP" ? "SEU PLANO" : "LIBERE O VIP"}
+              </Text>
+              <Text style={styles.vipTitleLarge}>
+                {playerType === "VIP" ? "VIP ATIVO" : "UPGRADE"}
+              </Text>
+              <Text style={styles.vipSubCenter}>
+                {playerType === "VIP"
+                  ? "Toque para ver seu plano e renovar."
+                  : "Toque aqui para subir de nivel e liberar mais beneficios."}
+              </Text>
+              {/* legacy title kept replaced below */}
               <Text style={styles.vipTitle}>
                 {playerType === "VIP" ? "Conta VIP" : "Conta FREE"}
               </Text>
-              <Text style={styles.vipSub}>
+              <Text style={styles.vipSubLegacy}>
                 {playerType === "VIP"
                   ? "Você tem benefícios e 3 slots de personagens."
                   : "Upgrade para VIP e tenha 3 slots de personagens."}
               </Text>
+              {playerType === "VIP" && vipExpiresText ? (
+                <Text style={styles.vipMeta}>Validade VIP ate {vipExpiresText}.</Text>
+              ) : null}
+              {trainerLicenseText ? (
+                <Text style={styles.vipMeta}>Licenca de treinador ate {trainerLicenseText}.</Text>
+              ) : null}
             </View>
           </LinearGradient>
         </Pressable>
 
-        {/* ECoin */}
+        {/* Loja monetizada */}
         <View style={styles.ecoinRow}>
           <View style={styles.ecoinBox}>
-            <Text style={styles.ecoinLabel}>ECoin</Text>
+            <Text style={styles.ecoinLabel}>Ecoins</Text>
             <Text style={styles.ecoinValue}>{ecoinBalance}</Text>
           </View>
-          <Pressable onPress={onBuyEcoin} style={styles.ecoinBuyBtn}>
+          <Pressable onPress={onOpenStore} style={styles.ecoinBuyBtn}>
             <Text style={styles.ecoinBuyText}>Comprar</Text>
           </Pressable>
         </View>
@@ -510,16 +565,54 @@ const styles = StyleSheet.create({
   settingsText: { color: COLORS.white, fontWeight: "700" },
 
   vipCardWrap: { marginTop: 8, marginBottom: 12 },
-  vipGlow: { borderRadius: 16, padding: 1 },
-  vipCard: {
-    backgroundColor: "rgba(0,0,0,0.35)",
-    borderRadius: 15,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.10)",
+  vipGlow: {
+    borderRadius: 22,
+    padding: 1.5,
+    shadowColor: "#60A5FA",
+    shadowOpacity: 0.35,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 10,
   },
-  vipTitle: { color: COLORS.white, fontWeight: "900", fontSize: 16 },
-  vipSub: { color: "rgba(255,255,255,0.70)", marginTop: 4 },
+  vipCard: {
+    backgroundColor: "rgba(4,8,20,0.76)",
+    borderRadius: 20,
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.12)",
+    alignItems: "center",
+  },
+  vipEyebrow: {
+    color: "rgba(255,255,255,0.76)",
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 2.4,
+  },
+  vipTitleLarge: {
+    color: COLORS.white,
+    fontWeight: "900",
+    fontSize: 30,
+    letterSpacing: 1.5,
+    textAlign: "center",
+    marginTop: 4,
+  },
+  vipSubCenter: {
+    color: "rgba(255,255,255,0.84)",
+    marginTop: 6,
+    textAlign: "center",
+    fontWeight: "700",
+    lineHeight: 18,
+  },
+  vipTitle: { display: "none" },
+  vipSubLegacy: { display: "none" },
+  vipMeta: {
+    color: "rgba(255,255,255,0.72)",
+    marginTop: 6,
+    textAlign: "center",
+    fontSize: 12,
+    fontWeight: "700",
+  },
 
   ecoinRow: { flexDirection: "row", gap: 10, alignItems: "center", marginBottom: 10 },
   ecoinBox: {

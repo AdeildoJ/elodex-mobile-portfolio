@@ -56,6 +56,11 @@ function getItemImageUrl(itemId: string) {
   return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/${itemId}.png`;
 }
 
+function requiresPokemonTarget(item: InventoryEntry | null) {
+  if (!item?.effectType) return true;
+  return !["UNLOCK_GYM_SCENARIO", "UNLOCK_GYM_NPC", "ACTIVATE_GYM_MAIN_TEAM_SLOT"].includes(item.effectType);
+}
+
 type Props = {
   items: InventoryEntry[];
   capacityUsed: number;
@@ -134,7 +139,7 @@ export function BagItems({
             {items.map((item) => (
               <View key={item.id} style={styles.itemCard}>
                 <View style={styles.itemImageWrap}>
-                  <Image source={{ uri: getItemImageUrl(item.id) }} style={styles.itemImage} resizeMode="contain" />
+                  <Image source={{ uri: item.imageUrl || getItemImageUrl(item.id) }} style={styles.itemImage} resizeMode="contain" />
                 </View>
 
                 <View style={{ flex: 1 }}>
@@ -173,28 +178,44 @@ export function BagItems({
             <Text style={styles.modalTitle}>
               {selectedItem ? `Usar ${selectedItem.name}` : "Usar item"}
             </Text>
-            <Text style={styles.modalSub}>Escolha o Pokemon alvo.</Text>
+            <Text style={styles.modalSub}>
+              {requiresPokemonTarget(selectedItem) ? "Escolha o Pokemon alvo." : "Confirme a ativacao deste item na mochila."}
+            </Text>
 
-            <ScrollView style={{ maxHeight: 260 }} contentContainerStyle={{ gap: 8 }}>
-              {activeTeam.map(({ pokemon, slotIndex }) => (
-                <Pressable
-                  key={`slot_${slotIndex}`}
-                  style={styles.slotRow}
-                  disabled={loading}
-                  onPress={() => handleUseOnSlot(slotIndex)}
-                >
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.slotName}>
-                      Slot {slotIndex} - {pokemon.nickname || pokemon.name}
-                    </Text>
-                    <Text style={styles.slotMeta}>
-                      Nv {pokemon.level} | HP {pokemon.hpCurrent}/{pokemon.hpTotal}
-                    </Text>
-                  </View>
-                  {loading ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.slotCta}>Usar</Text>}
-                </Pressable>
-              ))}
-            </ScrollView>
+            {requiresPokemonTarget(selectedItem) ? (
+              <ScrollView style={{ maxHeight: 260 }} contentContainerStyle={{ gap: 8 }}>
+                {activeTeam.map(({ pokemon, slotIndex }) => (
+                  <Pressable
+                    key={`slot_${slotIndex}`}
+                    style={styles.slotRow}
+                    disabled={loading}
+                    onPress={() => handleUseOnSlot(slotIndex)}
+                  >
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.slotName}>
+                        Slot {slotIndex} - {pokemon.nickname || pokemon.name}
+                      </Text>
+                      <Text style={styles.slotMeta}>
+                        Nv {pokemon.level} | HP {pokemon.hpCurrent}/{pokemon.hpTotal}
+                      </Text>
+                    </View>
+                    {loading ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.slotCta}>Usar</Text>}
+                  </Pressable>
+                ))}
+              </ScrollView>
+            ) : (
+              <Pressable
+                style={styles.slotRow}
+                disabled={loading || !selectedItem}
+                onPress={() => handleUseOnSlot(1)}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.slotName}>{selectedItem?.name || "Ativar item"}</Text>
+                  <Text style={styles.slotMeta}>{selectedItem?.description || "Disponibiliza o item para uso no GYM."}</Text>
+                </View>
+                {loading ? <ActivityIndicator color={COLORS.white} /> : <Text style={styles.slotCta}>Ativar</Text>}
+              </Pressable>
+            )}
 
             <Pressable
               disabled={loading}

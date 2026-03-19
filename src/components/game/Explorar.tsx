@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Alert, Animated, Image, ImageBackground, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
+import { router } from "expo-router";
 import { collection, doc, getDoc, getDocs, limit, query, setDoc, where } from "firebase/firestore";
 
 import { COLORS } from "../../theme/colors";
@@ -8,8 +9,9 @@ import { db } from "../../services/firebase/firebaseConfig";
 import { BIOMES, type BiomeDef } from "../../data/biomes";
 import pokemonSpecies from "../../data/pokemon/pokemonSpecies.json";
 import pokemonMoves from "../../data/pokemon/pokemonMoves.json";
+import type { PlayerGymDoc } from "../../services/firebase/gym.service";
 import { BattleScene } from "../battle/BattleScene";
-import { getScenarioAssets } from "../battle/scenarioAssets";
+import { resolveScenarioAssetOverrides } from "../battle/remoteScenarioAssets";
 import type { BattleAssetSet, BattleMonster, BattleMove, BattleWeather } from "../battle/types";
 import { buildBattleMove } from "../battle/moveCatalog";
 import { biomeToBattleBackground } from "../../explore/BiomeManager";
@@ -28,6 +30,10 @@ type Props = {
   characterId?: string;
   characterRegion?: string;
   team?: TeamMon[];
+  gymMode?: boolean;
+  gymData?: PlayerGymDoc | null;
+  trainerLicenseBiomeIds?: string[];
+  trainerShinyBonusPercent?: number;
   onPokemonCenterHeal?: () => Promise<void> | void;
   onBattleTeamSync?: (payload: { slotIndex: number; hpCurrent: number; hpTotal: number }[]) => Promise<void> | void;
   onWildDefeated?: (p: { speciesId: number; level: number; slotIndices: number[] }) => Promise<void> | void;
@@ -35,9 +41,10 @@ type Props = {
   pokeballs?: { id: string; name: string; quantity: number }[];
   onTryCapture?: (p: {
     ballId: string;
-    encounter: { speciesId: number; speciesName: string; level: number; hpCurrent: number; hpTotal: number; biomeId?: string; moves?: string[] };
+    encounter: { speciesId: number; speciesName: string; level: number; hpCurrent: number; hpTotal: number; biomeId?: string; moves?: string[]; isShiny?: boolean };
   }) => Promise<{ ok: boolean; message: string }>;
   onExploreSteps?: (steps: number) => Promise<void> | void;
+  onBiomeChanged?: (payload: { biomeId: string; biomeName: string }) => void;
   onNpcAction?: (payload: {
     role: "nurse" | "breeder" | "specialist" | "remember";
     npcName: string;
@@ -60,6 +67,10 @@ type BiomeState = BiomeDef & {
   npcs?: BiomeNpc[];
   battleAssets?: BattleAssetSet;
   battleScenarios?: string[];
+  requiresTicket?: boolean;
+  ticketProductCode?: string | null;
+  requiresTrainerLicense?: boolean;
+  trainerLicenseProductCode?: string | null;
 };
 type SpawnCandidate = {
   speciesId: number;
@@ -79,6 +90,7 @@ type Encounter = {
   speciesId: number;
   speciesName: string;
   spriteUrl: string | null;
+  isShiny?: boolean;
   level: number;
   biomeId: string;
   biomeName: string;
@@ -91,6 +103,12 @@ type Encounter = {
   releasedDocId?: string;
   isReleased?: boolean;
   battleAssets?: BattleAssetSet;
+};
+
+type GymScenarioState = {
+  imageUrl: string | null;
+  battleAssets: BattleAssetSet | null;
+  weather: BattleWeather;
 };
 
 const VERSION_ID = "elodex-base";
@@ -176,10 +194,11 @@ function normalizeNpcList(raw: unknown): BiomeNpc[] {
     if (!row || typeof row !== "object") return;
     const data = row as Record<string, unknown>;
     const roleRaw = String(data.role || "").trim().toLowerCase();
-    const role =
-      roleRaw === "nurse" || roleRaw === "breeder" || roleRaw === "specialist" || roleRaw === "remember"
-        ? (roleRaw as BiomeNpc["role"])
-        : "remember";
+    let role: BiomeNpc["role"] = "remember";
+    if (roleRaw === "nurse" || roleRaw === "enfermeiro") role = "nurse";
+    else if (roleRaw === "breeder" || roleRaw === "criador") role = "breeder";
+    else if (roleRaw === "specialist" || roleRaw === "especialista") role = "specialist";
+    else if (roleRaw === "remember") role = "remember";
     const name = String(data.name || "").trim();
     if (!name) return;
     out.push({
@@ -214,6 +233,45 @@ function encounterChanceForCandidate(c: SpawnCandidate) {
   }
   if (c.mode === "group") return 38;
   return 28;
+}
+
+function buildGymCandidates(gymType: string, team: TeamMon[]): SpawnCandidate[] {
+  const normalizedType = String(gymType || "").trim().toLowerCase();
+  if (!normalizedType) return [];
+
+  const realTeam = team.filter((mon) => n(mon.speciesId) > 0 && n(mon.level) > 0);
+  const averageLevel = realTeam.length
+    ? Math.max(3, Math.round(realTeam.reduce((sum, mon) => sum + n(mon.level), 0) / realTeam.length))
+    : 12;
+  const minLevel = Math.max(2, averageLevel - 4);
+  const maxLevel = Math.max(minLevel + 2, averageLevel + 4);
+  const rows = (Array.isArray(pokemonSpecies) ? (pokemonSpecies as any[]) : Object.values(pokemonSpecies as any))
+    .filter((row: any) => {
+      const flags = row?.flags || {};
+      if (flags.legendary || flags.mythical) return false;
+      const types = getSpeciesTypes(n(row?.id ?? row?.speciesId));
+      return types.includes(normalizedType);
+    })
+    .slice(0, 180);
+
+  return rows.map((row: any) => ({
+    speciesId: Math.max(1, n(row?.id ?? row?.speciesId)),
+    min: minLevel,
+    max: maxLevel,
+    encounterRate: null,
+    captureLimit: null,
+    capturedCount: 0,
+    mode: "fallback" as const,
+  }));
+}
+
+function pickGymBattleBackground(gymType: string) {
+  const type = String(gymType || "").trim().toLowerCase();
+  if (["water", "ice"].includes(type)) return "beach" as const;
+  if (["rock", "ground", "steel"].includes(type)) return "cave" as const;
+  if (["grass", "bug"].includes(type)) return "forest" as const;
+  if (["electric", "normal"].includes(type)) return "city" as const;
+  return "grasslands" as const;
 }
 
 const entry = (id: number) => (Object.values(pokemonSpecies as any) as any[]).find((p) => n(p?.id ?? p?.speciesId) === id) ?? null;
@@ -280,6 +338,9 @@ function toBattleMonsterFromTeam(mon: TeamMon, slotIndex: number): BattleMonster
     sprite: { front: getBattleFrontSprite(mon.speciesId), back: getBattleBackSprite(mon.speciesId) },
     moves: moveList.map(toBattleMove),
     slotIndex,
+    expCurrent: Math.max(0, n((mon as any)?.expCurrent ?? 0)),
+    expToNext: Math.max(1, n((mon as any)?.expToNext ?? 100)),
+    expTotal: Math.max(0, n((mon as any)?.expTotal ?? (mon as any)?.expCurrent ?? 0)),
     abilityId: (mon as any)?.abilityId ?? null,
     heldItemId: (mon as any)?.heldItemId ?? (mon as any)?.itemId ?? null,
   };
@@ -318,6 +379,8 @@ export function Explorar({
   characterId,
   characterRegion,
   team = [],
+  gymMode = false,
+  gymData = null,
   onPokemonCenterHeal,
   onBattleTeamSync,
   onWildDefeated,
@@ -325,12 +388,16 @@ export function Explorar({
   pokeballs = [],
   onTryCapture,
   onExploreSteps,
+  onBiomeChanged,
   onNpcAction,
+  trainerLicenseBiomeIds = [],
+  trainerShinyBonusPercent = 0,
 }: Props) {
   const [loading, setLoading] = useState(true);
   const [biomes, setBiomes] = useState<BiomeState[]>([]);
   const [selectedBiomeId, setSelectedBiomeId] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  const [visibleBiomeGyms, setVisibleBiomeGyms] = useState<PlayerGymDoc[]>([]);
   const [encounter, setEncounter] = useState<Encounter | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [exploreFeedback, setExploreFeedback] = useState<string>("");
@@ -338,6 +405,7 @@ export function Explorar({
   const [battleVisible, setBattleVisible] = useState(false);
   const [transitioning, setTransitioning] = useState(false);
   const [healing, setHealing] = useState(false);
+  const [gymScenario, setGymScenario] = useState<GymScenarioState>({ imageUrl: null, battleAssets: null, weather: "none" });
   const transition = useMemo(() => new Animated.Value(0), []);
 
   const teamWithSlot = useMemo(() => team.map((p, idx) => ({ ...p, slotIndex: idx + 1 })), [team]);
@@ -359,41 +427,51 @@ export function Explorar({
   );
   const playerLeadIndex = useMemo(() => playerBattleTeam.findIndex((m) => m.hpCurrent > 0), [playerBattleTeam]);
   const enemyBattleTeam = useMemo(() => (encounter ? [toBattleMonsterFromEncounter(encounter)] : []), [encounter]);
+  const selectedBiome = useMemo(() => biomes.find((b) => b.id === selectedBiomeId) ?? null, [biomes, selectedBiomeId]);
+  const gymArea = useMemo<BiomeState | null>(() => {
+    if (!gymMode || !gymData?.active) return null;
+    const syntheticId = `gym-${String(gymData.id || gymData.ownerUid || "local").trim().toLowerCase()}`;
+    return {
+      ...(BIOMES[0] as BiomeDef),
+      id: syntheticId,
+      name: gymData.name || "GYM",
+      description: `Modo ${String(gymData.gymType || "").toUpperCase()}`,
+      minLevel: 2,
+      maxLevel: 80,
+      speciesPool: [],
+      battleWeather: gymScenario.weather,
+      battleAssets: gymScenario.battleAssets || undefined,
+      battleScenarios: gymData.scenarioThemeId ? [gymData.scenarioThemeId] : [],
+      unlockRules: undefined,
+      npcs: [],
+      requiresTicket: false,
+      ticketProductCode: null,
+      unlocked: true,
+    };
+  }, [gymMode, gymData, gymScenario]);
+  const selectedArea = gymMode ? gymArea : selectedBiome;
   const hasInjuredTeam = useMemo(
     () => team.some((m) => n(m.speciesId) > 0 && n(m.hpCurrent) < Math.max(1, n(m.hpTotal))),
     [team]
   );
 
-  const healAtPokemonCenter = async () => {
-    if (healing || battleVisible || transitioning) return;
-    if (!hasInjuredTeam) {
-      Alert.alert("Centro Pokemon", "Seu time ja esta totalmente recuperado.");
-      return;
-    }
-    try {
-      setHealing(true);
-      await onPokemonCenterHeal?.();
-      Alert.alert("Centro Pokemon", "Seus Pokemon foram curados completamente!");
-    } catch {
-      Alert.alert("Centro Pokemon", "Nao foi possivel concluir a cura agora.");
-    } finally {
-      setHealing(false);
-    }
-  };
-
   const onPressNpc = async (npc: BiomeNpc) => {
-    if (!selectedBiome || !selectedBiome.unlocked) return;
-    if (npc.role === "nurse") {
-      await healAtPokemonCenter();
-      return;
-    }
+    if (!selectedArea || !selectedArea.unlocked) return;
     await onNpcAction?.({
       role: npc.role,
       npcName: npc.name,
       specialistType: npc.specialistType ?? null,
-      biomeId: selectedBiome.id,
+      biomeId: selectedArea.id,
     });
   };
+
+  useEffect(() => {
+    if (!selectedBiome || gymMode) return;
+    onBiomeChanged?.({
+      biomeId: String(selectedBiome.id || "").trim().toLowerCase(),
+      biomeName: String(selectedBiome.name || selectedBiome.id || "").trim(),
+    });
+  }, [gymMode, onBiomeChanged, selectedBiome]);
 
   useEffect(() => {
     let alive = true;
@@ -411,6 +489,10 @@ export function Explorar({
             npcs?: BiomeNpc[];
             battleAssets?: BattleAssetSet;
             battleScenarios?: string[];
+            requiresTicket?: boolean;
+            ticketProductCode?: string | null;
+            requiresTrainerLicense?: boolean;
+            trainerLicenseProductCode?: string | null;
           }
         >();
         const unlock = new Map<string, boolean>();
@@ -449,6 +531,11 @@ export function Explorar({
                 npcs: normalizeNpcList(data.npcs),
                 battleAssets: normalizeBattleAssets(data.battleAssets),
                 battleScenarios: Array.isArray(data.battleScenarios) ? data.battleScenarios : [],
+                requiresTicket: Boolean(data.requiresTicket),
+                ticketProductCode: typeof data.ticketProductCode === "string" ? data.ticketProductCode : null,
+                requiresTrainerLicense: Boolean(data.requiresTrainerLicense),
+                trainerLicenseProductCode:
+                  typeof data.trainerLicenseProductCode === "string" ? data.trainerLicenseProductCode : null,
               });
             });
             completedMissionIds = missionsSnap.docs
@@ -468,6 +555,9 @@ export function Explorar({
               })
               .map((d) => String(d.id).trim().toLowerCase())
               .filter(Boolean);
+            accessIds = Array.from(
+              new Set([...accessIds, ...trainerLicenseBiomeIds.map((value) => String(value).trim().toLowerCase())])
+            );
           } catch {
             // ignore
           }
@@ -491,6 +581,10 @@ export function Explorar({
             const unlocked = unlock.has(base.id)
               ? !!unlock.get(base.id)
               : unlockedByRule || !!base.unlockedByDefault;
+            const requiresTicket = !!remote?.requiresTicket;
+            const requiresTrainerLicense = !!remote?.requiresTrainerLicense;
+            const ticketUnlocked = !requiresTicket || accessIds.includes(base.id);
+            const licenseUnlocked = !requiresTrainerLicense || accessIds.includes(base.id);
             return {
               ...base,
               name: remote?.name || base.name,
@@ -500,7 +594,11 @@ export function Explorar({
               battleScenarios: remote?.battleScenarios || [],
               unlockRules: unlockRules || undefined,
               npcs: remote?.npcs ?? [],
-              unlocked,
+              requiresTicket,
+              ticketProductCode: remote?.ticketProductCode || null,
+              requiresTrainerLicense,
+              trainerLicenseProductCode: remote?.trainerLicenseProductCode || null,
+              unlocked: unlocked && ticketUnlocked && licenseUnlocked,
             };
           });
 
@@ -526,9 +624,72 @@ export function Explorar({
     return () => clearInterval(timer);
   }, []);
 
-  const selectedBiome = useMemo(() => biomes.find((b) => b.id === selectedBiomeId) ?? null, [biomes, selectedBiomeId]);
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!gymMode || !gymData?.scenarioThemeId) {
+      setGymScenario({ imageUrl: null, battleAssets: null, weather: "none" });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    (async () => {
+      try {
+        const [scenarioSnap, remoteAssets] = await Promise.all([
+          getDoc(doc(db, "scenarios", String(gymData.scenarioThemeId).trim().toLowerCase())),
+          resolveScenarioAssetOverrides(String(gymData.scenarioThemeId)),
+        ]);
+        if (cancelled) return;
+        const data = scenarioSnap.exists() ? (scenarioSnap.data() as Record<string, unknown>) : {};
+        const climateWeather =
+          String(data.specialType || "").trim().toLowerCase() === "climate"
+            ? normalizeWeather(data.climateType || data.weather)
+            : "none";
+        setGymScenario({
+          imageUrl: String(data.processedImageUrl || data.imageUrl || "").trim() || null,
+          battleAssets: remoteAssets ? ({ ...remoteAssets } as BattleAssetSet) : null,
+          weather: climateWeather,
+        });
+      } catch {
+        if (!cancelled) {
+          setGymScenario({ imageUrl: null, battleAssets: null, weather: "none" });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [gymMode, gymData?.scenarioThemeId]);
+
+  useEffect(() => {
+    if (gymMode || !selectedBiomeId) {
+      setVisibleBiomeGyms([]);
+      return;
+    }
+    let cancelled = false;
+    getDocs(query(collection(db, "gyms"), where("biomeId", "==", selectedBiomeId)))
+      .then((snap) => {
+        if (cancelled) return;
+        setVisibleBiomeGyms(
+          snap.docs
+            .map((row) => ({ id: row.id, ...(row.data() as Omit<PlayerGymDoc, "id">) }))
+            .filter((row) => String(row.status || "").toLowerCase() !== "removed")
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setVisibleBiomeGyms([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [gymMode, refreshNonce, selectedBiomeId]);
 
   const loadCandidates = async (biome: BiomeState): Promise<SpawnCandidate[]> => {
+    if (gymMode && gymData?.gymType) {
+      return buildGymCandidates(gymData.gymType, team);
+    }
     const out = new Map<number, SpawnCandidate>();
     const docId = `${VERSION_ID}_${biome.id}`;
     try {
@@ -632,12 +793,12 @@ export function Explorar({
 
   const rollEncounter = async () => {
     if (transitioning || battleVisible) return;
-    if (!selectedBiome || !selectedBiome.unlocked) return;
+    if (!selectedArea || !selectedArea.unlocked) return;
     setExploreFeedback("");
-    const cands = await loadCandidates(selectedBiome);
+    const cands = await loadCandidates(selectedArea);
     if (!cands.length) {
       setEncounter(null);
-      setExploreFeedback("0 Pokemon na area.");
+      setExploreFeedback(gymMode ? "Nenhum Pokemon compativel com o tipo do GYM foi encontrado." : "0 Pokemon na area.");
       return;
     }
     const extinctRisk =
@@ -691,11 +852,13 @@ export function Explorar({
     const real = b ? calcStats(level, b, nature, { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 }, { hp: 0, atk: 0, def: 0, spa: 0, spd: 0, spe: 0 }) : null;
     const hpTotal = Math.max(10, n(real?.hp || 20 + level * 2));
     const hpCurrent = hpTotal;
-    let finalAssets = selectedBiome.battleAssets || {};
-    const scenarios = selectedBiome.battleScenarios || [];
+    const shinyChancePercent = Math.max(0, 0.1 + Number(trainerShinyBonusPercent || 0));
+    const isShiny = Math.random() * 100 < shinyChancePercent;
+    let finalAssets = selectedArea?.battleAssets || {};
+    const scenarios = selectedArea?.battleScenarios || [];
     if (scenarios.length > 0) {
       const rndScen = scenarios[Math.floor(Math.random() * scenarios.length)];
-      const sAssets = getScenarioAssets(String(rndScen));
+      const sAssets = await resolveScenarioAssetOverrides(String(rndScen));
       if (sAssets) finalAssets = { ...finalAssets, ...sAssets };
     }
 
@@ -703,9 +866,10 @@ export function Explorar({
       speciesId: c.speciesId,
       speciesName: speciesName(c.speciesId),
       spriteUrl: speciesSprite(c.speciesId),
+      isShiny,
       level,
-      biomeId: selectedBiome.id,
-      biomeName: selectedBiome.name,
+      biomeId: selectedArea.id,
+      biomeName: selectedArea.name,
       gender: Math.random() < 0.5 ? "M" : "F",
       abilityId: ability,
       nature,
@@ -719,7 +883,9 @@ export function Explorar({
     setExploreFeedback(
       c.mode === "released"
         ? "Pokemon abandonado detectado. Ele pode fugir com facilidade."
-        : ""
+        : isShiny
+          ? "Encontro brilhante detectado."
+          : ""
     );
   };
 
@@ -745,41 +911,86 @@ export function Explorar({
 
   return (
     <View style={styles.wrap}>
-      <Text style={styles.title}>Explorar</Text>
+      <Text style={styles.title}>{gymMode ? "Modo GYM" : "Explorar"}</Text>
       <View style={styles.refreshRow}>
         <Pressable style={styles.refreshBtn} onPress={() => setRefreshNonce((n) => n + 1)}>
-          <Text style={styles.refreshBtnText}>Atualizar Bioma/NPC</Text>
+          <Text style={styles.refreshBtnText}>{gymMode ? "Atualizar ambiente do GYM" : "Atualizar Bioma/NPC"}</Text>
         </Pressable>
       </View>
-      <ScrollView horizontal contentContainerStyle={styles.row}>
-        {biomes.map((b) => (
-          <Pressable
-            key={b.id}
-            onPress={() => !battleVisible && !transitioning && setSelectedBiomeId(b.id)}
-            style={[styles.chip, b.id === selectedBiomeId && styles.chipActive, !b.unlocked && styles.chipLocked]}
-          >
-            <Text style={styles.chipText}>{b.name}</Text>
-          </Pressable>
-        ))}
-      </ScrollView>
+      {!gymMode ? (
+        <ScrollView horizontal contentContainerStyle={styles.row}>
+          {biomes.map((b) => (
+            <Pressable
+              key={b.id}
+              onPress={() => !battleVisible && !transitioning && setSelectedBiomeId(b.id)}
+              style={[styles.chip, b.id === selectedBiomeId && styles.chipActive, !b.unlocked && styles.chipLocked]}
+            >
+              <Text style={styles.chipText}>{b.name}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      ) : (
+        <View style={styles.centerCard}>
+          <Text style={styles.centerTitle}>{gymData?.name || "GYM"}</Text>
+          <Text style={styles.centerMeta}>Ambiente ativo do tipo {String(gymData?.gymType || "").toUpperCase()}</Text>
+        </View>
+      )}
 
-      {selectedBiome ? (
-        <ImageBackground source={BIOME_IMAGE_BY_ID[selectedBiome.id]} style={styles.biomeImage} imageStyle={styles.biomeImageInner}>
+      {selectedArea ? (
+        <ImageBackground
+          source={
+            gymMode && gymScenario.imageUrl
+              ? { uri: gymScenario.imageUrl }
+              : BIOME_IMAGE_BY_ID[selectedArea.id] || BIOME_IMAGE_BY_ID["floresta-esmeralda"]
+          }
+          style={styles.biomeImage}
+          imageStyle={styles.biomeImageInner}
+        >
           <View style={styles.biomeOverlay} />
-          <View style={styles.biomeLabelWrap}><Text style={styles.biomeLabel}>{selectedBiome.name}</Text></View>
+          <View style={styles.biomeLabelWrap}><Text style={styles.biomeLabel}>{selectedArea.name}</Text></View>
         </ImageBackground>
       ) : null}
 
-      <Pressable style={styles.cta} disabled={!selectedBiome || !selectedBiome.unlocked || battleVisible || transitioning} onPress={rollEncounter}>
-        <Text style={styles.ctaText}>Explorar bioma</Text>
+      {!gymMode && selectedArea && visibleBiomeGyms.length > 0 ? (
+        <View style={styles.npcSection}>
+          <Text style={styles.npcSectionTitle}>GYMs visiveis neste bioma</Text>
+          <ScrollView horizontal contentContainerStyle={styles.npcRow} showsHorizontalScrollIndicator={false}>
+            {visibleBiomeGyms.map((gym) => (
+              <Pressable
+                key={gym.id}
+                style={styles.npcCard}
+                onPress={() =>
+                  router.push({
+                    pathname: "/gym",
+                    params: {
+                      characterId: characterId || "",
+                      biomeId: selectedArea.id,
+                      targetGymId: gym.id,
+                    },
+                  })
+                }
+              >
+                {gym.primaryBadgeImageUrl ? <Image source={{ uri: gym.primaryBadgeImageUrl }} style={styles.npcAvatar} /> : null}
+                <Text style={styles.npcName} numberOfLines={1}>{gym.name || gym.ownerCharacterName || "GYM"}</Text>
+                <Text style={styles.npcRole} numberOfLines={2}>
+                  {String(gym.gymType || "").toUpperCase()} • {gym.primaryBadgeName || "Insignia"}
+                </Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+        </View>
+      ) : null}
+
+      <Pressable style={styles.cta} disabled={!selectedArea || !selectedArea.unlocked || battleVisible || transitioning} onPress={rollEncounter}>
+        <Text style={styles.ctaText}>{gymMode ? "Explorar GYM" : "Explorar bioma"}</Text>
       </Pressable>
       {!!exploreFeedback ? <Text style={styles.exploreFeedback}>{exploreFeedback}</Text> : null}
 
-      {selectedBiome?.npcs?.length ? (
+      {selectedArea?.npcs?.length ? (
         <View style={styles.npcSection}>
-          <Text style={styles.npcSectionTitle}>NPCs do Bioma</Text>
+          <Text style={styles.npcSectionTitle}>{gymMode ? "NPCs do GYM" : "NPCs do Bioma"}</Text>
           <ScrollView horizontal contentContainerStyle={styles.npcRow} showsHorizontalScrollIndicator={false}>
-            {selectedBiome.npcs.map((npc) => (
+            {selectedArea.npcs.map((npc) => (
               <Pressable
                 key={npc.id}
                 style={styles.npcCard}
@@ -804,8 +1015,12 @@ export function Explorar({
         </View>
       ) : (
         <View style={styles.centerCard}>
-          <Text style={styles.centerTitle}>NPCs</Text>
-          <Text style={styles.centerMeta}>Este bioma ainda nao possui NPCs configurados no admin.</Text>
+          <Text style={styles.centerTitle}>{gymMode ? "Modo GYM" : "NPCs"}</Text>
+          <Text style={styles.centerMeta}>
+            {gymMode
+              ? "Somente Pokemon compativeis com o tipo principal do GYM podem aparecer aqui."
+              : "Este bioma ainda nao possui NPCs configurados no admin."}
+          </Text>
         </View>
       )}
 
@@ -842,11 +1057,11 @@ export function Explorar({
       <BattleScene
         visible={battleVisible && !!encounter && playerLeadIndex >= 0}
         mode="wild"
-        backgroundKind={biomeToBattleBackground(encounter?.biomeId)}
+        backgroundKind={gymMode ? pickGymBattleBackground(String(gymData?.gymType || "")) : biomeToBattleBackground(encounter?.biomeId)}
         battleAssets={encounter?.battleAssets || null}
         initialFieldState={{
-          weather: normalizeWeather(selectedBiome?.battleWeather || "none"),
-          weatherTurns: 5,
+          weather: gymMode ? gymScenario.weather : normalizeWeather(selectedBiome?.battleWeather || "none"),
+          weatherTurns: gymMode && gymScenario.weather !== "none" ? 999 : 5,
         }}
         playerTeam={playerBattleTeam}
         enemyTeam={enemyBattleTeam}
@@ -879,6 +1094,7 @@ export function Explorar({
               hpTotal: Math.max(1, enemy.hpTotal),
               biomeId: encounter.biomeId,
               moves: encounter.moves,
+              isShiny: encounter.isShiny,
             },
           });
           if (out.ok) {

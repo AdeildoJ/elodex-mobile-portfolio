@@ -24,13 +24,18 @@ import { auth, storage, db } from "../../src/services/firebase/firebaseConfig";
 import {
   createCharacterForPlayer,
   getCharacterForPlayer,
+  isValidCharacterDocData,
   updateCharacterForPlayer,
 } from "../../src/services/firebase/characters.service";
 
-import { getPlayerProfile } from "../../src/services/firebase/players.service";
+import {
+  getPlayerProfile,
+  resolveEffectiveCharacterLimit,
+  resolveEffectivePlayerType,
+} from "../../src/services/firebase/players.service";
 
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
+import { collection, doc, getDocs, serverTimestamp, setDoc } from "firebase/firestore";
 
 /**
  * ✅ Catálogo fixo local (JSON)
@@ -194,6 +199,7 @@ export default function CreateCharacterScreen() {
   const [saving, setSaving] = useState<boolean>(false);
 
   const [playerType, setPlayerType] = useState<"FREE" | "VIP">("FREE");
+  const [maxCharacters, setMaxCharacters] = useState<number>(1);
 
   const [form, setForm] = useState<FormState>({
     name: "",
@@ -307,8 +313,9 @@ export default function CreateCharacterScreen() {
         }
 
         const profile = await getPlayerProfile(user.uid);
-        if (mounted && profile?.playerType) {
-          setPlayerType(profile.playerType);
+        if (mounted && profile) {
+          setPlayerType(resolveEffectivePlayerType(profile));
+          setMaxCharacters(resolveEffectiveCharacterLimit(profile));
         }
 
         if (characterId) {
@@ -515,6 +522,26 @@ export default function CreateCharacterScreen() {
           : basePayload;
 
       if (!isEditing) {
+        const charsSnap = await getDocs(collection(db, "players", user.uid, "characters"));
+        const countedCharacters = charsSnap.docs
+          .filter((row) => row.id !== "_meta")
+          .map((row) => ({
+            id: row.id,
+            data: row.data(),
+            valid: isValidCharacterDocData(row.data()),
+            name: String(row.data()?.name || "").trim(),
+          }))
+          .filter((row) => row.valid);
+        const currentCharacters = countedCharacters.length;
+        const allowedCharacters = Math.max(1, maxCharacters);
+        if (currentCharacters >= allowedCharacters) {
+          const summary = countedCharacters
+            .map((row) => `${row.name || "SemNome"} [${row.id}]`)
+            .join(", ");
+          throw new Error(
+            `Limite de personagens atingido (${allowedCharacters}). Encontrados: ${currentCharacters}. Slots: ${summary || "nenhum"}.`
+          );
+        }
         // ✅ create (sem avatarUrl undefined)
         const newId: string = await createCharacterForPlayer(user.uid, payload);
 
@@ -674,6 +701,13 @@ export default function CreateCharacterScreen() {
         <Text style={styles.title}>
           {isEditing ? "Editar Personagem" : "Criar Personagem"}
         </Text>
+
+        {/* botão de compra de Ecoin */}
+        <View style={styles.section}>
+          <Pressable onPress={() => router.push("/payments/ecoin")} style={styles.button}> 
+            <Text style={styles.buttonText}>Comprar Ecoin</Text>
+          </Pressable>
+        </View>
 
         {/* Avatar */}
         <View style={styles.section}>
