@@ -21,7 +21,8 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.alaastorjr.elodexmobile"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -29,6 +30,20 @@
     "plugins": [
       "expo-router",
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "router": {},
+      "firebaseApiKey": "AIzaSyB4mQXJ9y2vLGOwLa1v8J3FJwNbabOIwGY",
+      "firebaseAuthDomain": "elodex-1c8a1.firebaseapp.com",
+      "firebaseProjectId": "elodex-1c8a1",
+      "firebaseStorageBucket": "elodex-1c8a1.firebasestorage.app",
+      "firebaseMessagingSenderId": "943295016695",
+      "firebaseAppId": "943295016695:web:2c174a29ccb6e56aadedf2",
+      "paymentApiBaseUrl": "https://elodex-1c8a1.web.app",
+      "eas": {
+        "projectId": "64b7fef3-b5e9-44dd-a3c8-c3018f3e785d"
+      }
+    },
+    "owner": "alaastorjr"
   }
 }

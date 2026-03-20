@@ -1,4 +1,5 @@
 import { auth } from "./firebaseConfig";
+import { runtimeConfig } from "../config/runtime";
 
 type LootType = "coins" | "item" | "pokemon";
 
@@ -27,7 +28,7 @@ type RecoverResponse = {
 };
 
 function getFunctionsBaseUrl() {
-  const projectId = String(process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID || "").trim();
+  const projectId = String(runtimeConfig.firebaseProjectId || "").trim();
   if (!projectId) throw new Error("Projeto Firebase não configurado.");
   return `https://southamerica-east1-${projectId}.cloudfunctions.net`;
 }

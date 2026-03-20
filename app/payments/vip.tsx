@@ -19,6 +19,7 @@ import {
   getVipPlans,
   type VipPlan,
 } from "../../src/services/firebase/monetization.service";
+import { runtimeConfig } from "../../src/services/config/runtime";
 import { setCheckoutSession } from "../../src/services/payments/checkoutSession";
 
 export default function VipPaymentScreen() {
@@ -31,7 +32,7 @@ export default function VipPaymentScreen() {
   const [statusText, setStatusText] = useState("Conta FREE");
   const [expiresText, setExpiresText] = useState<string | null>(null);
 
-  const paymentApiBaseUrl = (process.env.EXPO_PUBLIC_PAYMENT_API_BASE_URL || "").replace(/\/$/, "");
+  const paymentApiBaseUrl = String(runtimeConfig.paymentApiBaseUrl || "").replace(/\/$/, "");
   const isManageMode = useMemo(() => mode === "manage", [mode]);
 
   useEffect(() => {

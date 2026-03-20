@@ -12,6 +12,7 @@ import {
   getCheckoutSession,
 } from "../../src/services/payments/checkoutSession";
 import { auth, db } from "../../src/services/firebase/firebaseConfig";
+import { runtimeConfig } from "../../src/services/config/runtime";
 
 export default function PaymentCheckoutScreen() {
   const { orderId: orderIdParam, title: titleParam } = useLocalSearchParams<{
@@ -23,7 +24,7 @@ export default function PaymentCheckoutScreen() {
   const [loading, setLoading] = useState(true);
 
   const session = getCheckoutSession();
-  const paymentApiBaseUrl = (process.env.EXPO_PUBLIC_PAYMENT_API_BASE_URL || "").replace(/\/$/, "");
+  const paymentApiBaseUrl = String(runtimeConfig.paymentApiBaseUrl || "").replace(/\/$/, "");
   const orderId = String(orderIdParam || session?.orderId || "");
   const checkoutUrl = String(session?.checkoutUrl || "");
   const title = String(titleParam || session?.title || "Checkout");

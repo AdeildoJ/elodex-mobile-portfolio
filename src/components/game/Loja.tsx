@@ -18,6 +18,7 @@ import { collection, doc, getDoc, getDocs, query, runTransaction, serverTimestam
 import { auth, db } from "../../services/firebase/firebaseConfig";
 import { getMonetizationProducts, type MonetizationProduct } from "../../services/firebase/monetization.service";
 import { isGymMainTeamSlotProduct as isGymMainTeamSlotProductRoute, resolveProductRoute } from "../../services/monetization/product-routing.service";
+import { runtimeConfig } from "../../services/config/runtime";
 import {
   listenPlayerGymCustomizationUnlocks,
   purchaseGymCustomizationWithEcoins,
@@ -140,7 +141,7 @@ type GymCustomizationStoreItem = {
   price: number;
 };
 
-const PAYMENT_API_BASE_URL = (process.env.EXPO_PUBLIC_PAYMENT_API_BASE_URL || "").replace(/\/$/, "");
+const PAYMENT_API_BASE_URL = String(runtimeConfig.paymentApiBaseUrl || "").replace(/\/$/, "");
 const DEBUG_ECOIN_FLOW = true;
 
 const BALL_BONUS: Record<string, number> = {

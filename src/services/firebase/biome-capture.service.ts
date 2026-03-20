@@ -1,4 +1,5 @@
 import { auth } from "./firebaseConfig";
+import { runtimeConfig } from "../config/runtime";
 
 type RegisterBiomeCapturePayload = {
   biomeId: string;
@@ -6,7 +7,7 @@ type RegisterBiomeCapturePayload = {
 };
 
 function getFunctionsBaseUrl() {
-  const projectId = String(process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID || "").trim();
+  const projectId = String(runtimeConfig.firebaseProjectId || "").trim();
   if (!projectId) throw new Error("Projeto Firebase nao configurado.");
   return `https://southamerica-east1-${projectId}.cloudfunctions.net`;
 }
@@ -32,4 +33,3 @@ async function callFn<T>(endpoint: string, payload: Record<string, unknown>): Pr
 export async function registerBiomeCapture(payload: RegisterBiomeCapturePayload) {
   return callFn<{ ok: boolean; exhausted: boolean; remaining: number | null }>("registerBiomeCapture", payload);
 }
-

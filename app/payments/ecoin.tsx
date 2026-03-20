@@ -25,6 +25,7 @@ import {
   type EcoinPackage,
   type PlayerMonetizationHistoryEntry,
 } from "../../src/services/firebase/monetization.service";
+import { runtimeConfig } from "../../src/services/config/runtime";
 
 type OnlineMethod = "PIX" | "CREDIT" | "DEBIT";
 
@@ -62,7 +63,7 @@ export default function EcoinPurchaseScreen() {
   const [pixSession, setPixSession] = useState<PixSession | null>(null);
   const [checkoutSession, setCheckoutSession] = useState<CheckoutSession | null>(null);
 
-  const paymentApiBaseUrl = (process.env.EXPO_PUBLIC_PAYMENT_API_BASE_URL || "").replace(/\/$/, "");
+  const paymentApiBaseUrl = String(runtimeConfig.paymentApiBaseUrl || "").replace(/\/$/, "");
   const uid = auth.currentUser?.uid || "";
   const pendingOrders = useMemo(() => orders.filter((entry) => entry.status === "pending"), [orders]);
 
